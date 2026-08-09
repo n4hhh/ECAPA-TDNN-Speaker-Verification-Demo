@@ -77,7 +77,7 @@ remaining requirements.
 ### Clone Repository
 
 ```powershell
-git clone <REPOSITORY_URL>
+git clone https://github.com/n4hhh/ECAPA-TDNN-Speaker-Verification-Demo.git
 cd ECAPA-TDNN-Speaker-Verification-Demo
 ```
 
