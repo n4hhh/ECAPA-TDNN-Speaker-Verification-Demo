@@ -16,6 +16,7 @@ from src.model import (
     build_model_from_checkpoint,
     validate_checkpoint,
 )
+from src.model_thresholds import MODEL_THRESHOLDS, threshold_for_model
 
 
 class FakeFeatures(nn.Module):
@@ -72,6 +73,17 @@ def checkpoint() -> dict[str, object]:
 
 
 class CheckpointValidationTests(unittest.TestCase):
+    def test_calibrated_threshold_mapping_is_unchanged(self) -> None:
+        self.assertEqual(
+            MODEL_THRESHOLDS,
+            {
+                "RAW": 0.16837078332901,
+                "RANDOM": 0.16918502748012543,
+                "ADAPTIVE": 0.172615185379982,
+            },
+        )
+        self.assertEqual(threshold_for_model("adaptive"), MODEL_THRESHOLDS["ADAPTIVE"])
+
     def test_new_checkpoint_schema_is_accepted(self) -> None:
         metadata = validate_checkpoint(checkpoint())
         self.assertEqual(metadata.schema, CHECKPOINT_SCHEMA)

@@ -9,6 +9,26 @@ Enrollment and verification utterances do not need to contain the same sentence.
 Enrollment exists only in the current Streamlit session; the project does not
 create accounts, databases, or persistent speaker profiles.
 
+## Demo Flow
+
+The presentation UI follows three explicit stages:
+
+```text
+Enrollment -> Verification -> Result
+```
+
+1. Select `RAW`, `RANDOM`, or `ADAPTIVE` in the sidebar. `ADAPTIVE` remains the
+   default when its checkpoint is available.
+2. Create a session-only voice profile from the microphone or a WAV/MP3 upload.
+3. Record or upload a second, text-independent verification sample.
+4. Review the SAME/DIFFERENT decision, cosine similarity, calibrated threshold,
+   selected model, and the real preprocessing timings reported by the backend.
+
+Changing the model clears the model-specific enrollment. **Verify again** clears
+only the latest verification result and input, while **Clear enrollment** removes
+the current voice profile and result. Research configuration and backend details
+are kept in the sidebar so the main page remains focused on the live demo.
+
 ## Thesis Checkpoints
 
 Place the supplied checkpoints in `checkpoints/`:
@@ -64,29 +84,37 @@ audio
 -> cosine similarity
 ```
 
-Exact 48,000-sample mono/16 kHz input is used directly. Longer realtime
-recordings use WebRTC VAD only to choose one speech-rich contiguous 3-second
-window. Separated speech fragments are never concatenated. Too-short or
-insufficient-speech recordings are rejected with a clear validation error.
+Exact 48,000-sample mono/16 kHz input is used directly. The current realtime
+long-recording path is explicitly:
+
+```text
+WebRTC VAD
+-> one speech-rich contiguous 3-second window
+-> ECAPA embedding
+```
+
+It does not perform multi-segment inference or embedding aggregation. Separated
+speech fragments are never concatenated. Too-short or insufficient-speech
+recordings are rejected with a clear validation error.
 
 Cosine similarity is not a probability or confidence percentage.
 
 ## Thresholds And Decisions
 
-The demo does not invent operational thresholds. The checkpoints include best
-validation EER metadata, but a deployable SAME/DIFFERENT threshold must be
-calibrated from validation data for the intended operating condition.
+`src/model_thresholds.py` contains validation-calibrated empirical EER operating
+points for all three thesis conditions:
 
-Until calibrated thresholds are added in `src/model_thresholds.py`, the app
-shows:
+| Model | Decision threshold |
+| --- | ---: |
+| RAW | `0.16837078332901` |
+| RANDOM | `0.16918502748012543` |
+| ADAPTIVE | `0.172615185379982` |
 
-```text
-Operational Threshold: Not configured
-Decision: Not available
-```
-
-When real thresholds are configured, the UI will produce `SAME SPEAKER` or
-`DIFFERENT SPEAKER` from `similarity >= threshold`.
+The selected model's threshold is applied without modification using
+`similarity >= threshold`. Threshold selection does not use final-test data. If
+an additional compatible checkpoint has no configured threshold, the UI keeps
+the score visible but reports **Decision unavailable** instead of borrowing
+another model's operating point.
 
 ## Setup
 
@@ -155,12 +183,14 @@ python -m scripts.verify_pair enrollment.wav verification.wav --threshold 0.5
 ## Project Layout
 
 ```text
-app.py              Streamlit UI and session state
+app.py              Streamlit workflow, checkpoint selection, and session state
+ui/components.py    reusable presentation-only UI components
+ui/styles.css       local responsive visual design
 src/audio.py        decoding, model preprocessing, realtime segment selection
 src/model.py        checkpoint validation and strict ECAPA construction
 src/inference.py    embedding extraction and cosine scoring
 src/vad.py          WebRTC speech activity detection
-src/model_thresholds.py  nullable calibrated-threshold mapping
+src/model_thresholds.py  validation-calibrated per-model threshold mapping
 scripts/           diagnostics and CLI verification
 tests/             unit tests that avoid requiring huge real checkpoints
 ```

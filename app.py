@@ -1,4 +1,4 @@
-"""Local Streamlit UI for 1:1 speaker verification."""
+"""Presentation-ready Streamlit UI for 1:1 speaker verification."""
 
 from __future__ import annotations
 
@@ -8,28 +8,31 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Optional
 
-import streamlit as st
 import soundfile as sf
+import streamlit as st
 import torch
 
-from src.audio import (
-    AudioLoadError,
-    AudioValidationError,
-    InsufficientSpeechError,
-    SpeechWindowMetadata,
-)
+from src.audio import AudioLoadError, AudioValidationError, InsufficientSpeechError
 from src.inference import (
     RealtimeEmbedding,
     SpeakerVerifier,
     decision_from_threshold,
     score_embeddings,
 )
-from src.model import (
-    CheckpointCompatibilityError,
-    load_checkpoint,
-    validate_checkpoint,
-)
+from src.model import CheckpointCompatibilityError, load_checkpoint, validate_checkpoint
 from src.model_thresholds import threshold_for_model
+from ui.components import (
+    load_styles,
+    render_enrollment_ready,
+    render_header,
+    render_locked_verification,
+    render_privacy_note,
+    render_result_card,
+    render_sample_details,
+    render_score_visualization,
+    render_section_heading,
+    render_step_indicator,
+)
 
 LOGGER = logging.getLogger("speaker_verification_demo")
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -91,6 +94,13 @@ def clear_enrollment_state(
         # the recorder and uploader fresh keys on the next rerun, which clears their UI.
         state["enrollment_input_version"] = state.get("enrollment_input_version", 0) + 1
         state["verification_input_version"] = state.get("verification_input_version", 0) + 1
+
+
+def reset_verification_state(state: MutableMapping[str, Any]) -> None:
+    """Clear the latest comparison while retaining the enrolled voice profile."""
+
+    state["latest_verification_result"] = None
+    state["verification_input_version"] = state.get("verification_input_version", 0) + 1
 
 
 def activate_model(state: MutableMapping[str, Any], model_path: str) -> bool:
@@ -243,21 +253,6 @@ def process_audio_bytes(
             raise
 
 
-def render_metadata(metadata: SpeechWindowMetadata) -> None:
-    st.write(f"Original duration: {metadata.original_duration_seconds:.2f} s")
-    if metadata.vad_used:
-        st.write(f"Detected speech: {metadata.total_speech_seconds:.2f} s")
-    st.write(
-        "Selected segment: "
-        f"{metadata.selected_start_seconds:.2f} - {metadata.selected_end_seconds:.2f} s"
-    )
-    if metadata.vad_used:
-        st.write(
-            "Speech in segment: "
-            f"{metadata.speech_in_selected_window_seconds:.2f} s"
-        )
-
-
 def render_audio_input(
     section: str,
     version: int,
@@ -265,14 +260,14 @@ def render_audio_input(
     """Render one unambiguous microphone-or-upload source selector."""
 
     source = st.radio(
-        "Audio source",
+        "Choose input method",
         ("Record microphone", "Upload audio"),
         horizontal=True,
         key=f"{section}_source_{version}",
     )
     if source == "Record microphone":
         value = st.audio_input(
-            "Record a voice utterance",
+            "Record a voice sample",
             sample_rate=16_000,
             key=f"{section}_microphone_{version}",
             help="Speak naturally for several seconds.",
@@ -340,27 +335,53 @@ def _ordered_model_options(paths: list[Path]) -> list[str]:
     return ordered + [str(path) for path in paths if str(path) not in ordered]
 
 
-def main() -> None:
-    st.set_page_config(
-        page_title="Vietnamese Speaker Verification Demo",
-        layout="centered",
-    )
-    initialize_session_state(st.session_state)
+def _render_sidebar(
+    model_options: list[str],
+    selected_index: int,
+    rejected: list[tuple[Path, str]],
+) -> str:
+    """Render research configuration outside the primary user journey."""
 
-    st.title("Vietnamese Speaker Verification Demo")
-    st.caption("Text-independent ECAPA-TDNN speaker verification")
+    with st.sidebar:
+        st.header("Demo configuration")
+        st.caption(
+            "Select the thesis training condition used for both enrollment and verification."
+        )
+        selected_model = st.selectbox(
+            "Model",
+            model_options,
+            index=selected_index,
+            format_func=_checkpoint_label,
+            key="model_selector",
+        )
+        selected_label = _model_label(selected_model)
+        configured_threshold = threshold_for_model(selected_label)
+        st.caption(f"Checkpoint: `{Path(selected_model).name}`")
+        with st.expander("Advanced / Technical details"):
+            st.markdown(
+                f"""
+                - **Architecture:** ECAPA-TDNN
+                - **Base:** speechbrain/spkrec-ecapa-voxceleb
+                - **Embedding:** 192-D, L2 normalized
+                - **Audio input:** mono, 16 kHz
+                - **Model input:** one 3.0-second window
+                - **Features:** SpeechBrain FBank, 80 Mel bins
+                - **Realtime selection:** WebRTC VAD, contiguous speech-rich window
+                - **Scoring:** cosine similarity
+                - **Threshold:** {"Not configured" if configured_threshold is None else f"{configured_threshold:.4f}"}
+                - **Training condition:** {selected_label}
+                """
+            )
+        if rejected:
+            with st.expander("Skipped incompatible checkpoints"):
+                for path, error in rejected:
+                    st.write(f"**{path.name}:** {error}")
+    return selected_model
 
-    compatible, rejected = discover_compatible_checkpoints(CHECKPOINT_DIRECTORY)
-    if rejected:
-        with st.expander("Skipped incompatible checkpoints"):
-            for path, error in rejected:
-                st.write(f"{path.name}: {error}")
-    if not compatible:
-        st.error("No compatible .pt or .pth checkpoints were found in checkpoints/.")
-        st.stop()
 
-    model_options = _ordered_model_options(compatible)
-    active_path = st.session_state.get("active_model_path")
+def _selected_model_index(model_options: list[str], active_path: Optional[str]) -> int:
+    if active_path in model_options:
+        return model_options.index(active_path)
     adaptive_path = next(
         (
             option
@@ -369,26 +390,33 @@ def main() -> None:
         ),
         None,
     )
-    # Preserve the current choice across Streamlit reruns. On first launch, prefer the
-    # adaptive-noise checkpoint because it is the demo's primary operating condition.
-    if active_path in model_options:
-        selected_index = model_options.index(active_path)
-    elif adaptive_path is not None:
-        selected_index = model_options.index(adaptive_path)
-    else:
-        selected_index = 0
-    selected_model = st.selectbox(
-        "Model",
-        model_options,
-        index=selected_index,
-        format_func=_checkpoint_label,
-        key="model_selector",
+    return model_options.index(adaptive_path) if adaptive_path is not None else 0
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Voice ID · Vietnamese Speaker Verification",
+        page_icon="◉",
+        layout="centered",
+        initial_sidebar_state="expanded",
     )
+    initialize_session_state(st.session_state)
+    load_styles()
+    render_header()
+
+    compatible, rejected = discover_compatible_checkpoints(CHECKPOINT_DIRECTORY)
+    if not compatible:
+        st.error("No compatible .pt or .pth checkpoints were found in checkpoints/.")
+        st.stop()
+
+    model_options = _ordered_model_options(compatible)
+    selected_index = _selected_model_index(
+        model_options,
+        st.session_state.get("active_model_path"),
+    )
+    selected_model = _render_sidebar(model_options, selected_index, rejected)
     selected_label = _model_label(selected_model)
-    st.caption("ECAPA-TDNN · 192-D embedding · Cosine similarity")
     enrollment_invalidated = activate_model(st.session_state, selected_model)
-    if enrollment_invalidated:
-        st.info("Model changed. Please save a new enrollment utterance.")
 
     try:
         verifier = get_cached_verifier(*checkpoint_signature(Path(selected_model)))
@@ -400,139 +428,143 @@ def main() -> None:
         LOGGER.exception("Unexpected model loading failure")
         st.error("The selected model could not be loaded. See the terminal log for details.")
         st.stop()
-    st.success("Model ready")
+    st.sidebar.success("Model ready")
 
-    st.divider()
-    st.header("1. Enrollment Utterance")
-    enrollment_bytes, enrollment_mime, enrollment_suffix = render_audio_input(
-        "enrollment",
-        st.session_state["enrollment_input_version"],
-    )
-    if st.button("SAVE ENROLLMENT", type="primary", use_container_width=True):
-        if enrollment_bytes is None:
-            st.warning("Record or upload enrollment audio first.")
-        else:
-            try:
-                with st.spinner("Processing enrollment..."):
-                    enrollment_result = process_audio_bytes(
-                        verifier,
-                        enrollment_bytes,
-                        suffix=enrollment_suffix,
-                    )
-                save_enrollment_state(
-                    st.session_state,
-                    enrollment_result,
-                    selected_model,
-                    enrollment_bytes,
-                    enrollment_mime,
-                )
-            except Exception as exc:
-                show_processing_error("Enrollment", exc)
+    if enrollment_invalidated:
+        st.info("Model changed. Create a new voice profile for this model.")
 
-    if enrollment_is_ready(st.session_state, selected_model):
-        st.success("✓ Enrollment saved")
-        render_metadata(st.session_state["enrollment_metadata"])
-        if st.session_state["enrollment_audio_bytes"]:
-            st.audio(
-                st.session_state["enrollment_audio_bytes"],
-                format=st.session_state["enrollment_audio_mime"] or "audio/wav",
-            )
-
-    st.divider()
-    st.header("2. Verification Utterance")
-    verification_bytes, _, verification_suffix = render_audio_input(
-        "verification",
-        st.session_state["verification_input_version"],
-    )
     ready_to_verify = enrollment_is_ready(st.session_state, selected_model)
-    if not ready_to_verify:
-        st.info("Save an enrollment utterance before verification.")
-
-    if st.button(
-        "VERIFY SPEAKER",
-        type="primary",
-        use_container_width=True,
-        disabled=not ready_to_verify,
-    ):
-        if verification_bytes is None:
-            st.warning("Record or upload verification audio first.")
-        else:
-            try:
-                with st.spinner("Verifying speaker..."):
-                    verification_result = process_audio_bytes(
-                        verifier,
-                        verification_bytes,
-                        suffix=verification_suffix,
-                    )
-                    similarity = score_embeddings(
-                        st.session_state["enrollment_embedding"],
-                        verification_result.embedding,
-                    )
-                # Thresholds are calibrated separately for each training condition;
-                # using a different model's operating point would invalidate the decision.
-                threshold = threshold_for_model(selected_label)
-                same_speaker = decision_from_threshold(similarity, threshold)
-                st.session_state["latest_verification_result"] = {
-                    "similarity": similarity,
-                    "threshold": threshold,
-                    "same_speaker": same_speaker,
-                    "model_label": selected_label,
-                    "metadata": verification_result.metadata,
-                }
-            except Exception as exc:
-                show_processing_error("Verification", exc)
-
     latest_result = st.session_state.get("latest_verification_result")
-    if latest_result is not None and ready_to_verify:
-        st.subheader("Verification Result")
-        st.write(f"Model: {latest_result.get('model_label', selected_label)}")
-        st.write(f"Similarity Score: `{latest_result['similarity']:.4f}`")
-        if latest_result["threshold"] is None:
-            st.write("Operational Threshold: Not configured")
-            st.write("Decision: Not available")
-            st.info(
-                "Unavailable until a validation-calibrated threshold is configured."
-            )
-        else:
-            st.write(f"Decision Threshold: `{latest_result['threshold']:.4f}`")
-            if latest_result["same_speaker"]:
-                st.success("SAME SPEAKER")
+    current_step = (
+        3 if latest_result is not None and ready_to_verify else 2 if ready_to_verify else 1
+    )
+    render_step_indicator(current_step)
+
+    render_section_heading(
+        1,
+        "Create Voice Profile",
+        "Speak naturally for several seconds. Your sample is used only for the current demo session.",
+        eyebrow="Enrollment",
+    )
+    if not ready_to_verify:
+        enrollment_bytes, enrollment_mime, enrollment_suffix = render_audio_input(
+            "enrollment",
+            st.session_state["enrollment_input_version"],
+        )
+        render_privacy_note()
+        if st.button("CREATE VOICE PROFILE", type="primary", use_container_width=True):
+            if enrollment_bytes is None:
+                st.warning("Record or upload enrollment audio first.")
             else:
-                st.error("DIFFERENT SPEAKER")
-        render_metadata(latest_result["metadata"])
-
-    st.divider()
-    if st.button(
-        "CLEAR ENROLLMENT",
-        use_container_width=True,
-        disabled=not bool(st.session_state.get("enrollment_saved")),
-    ):
-        clear_enrollment_state(st.session_state)
-        st.rerun()
-
-    with st.expander("Technical Information"):
-        st.write("Model: ECAPA-TDNN")
-        st.write("Base: speechbrain/spkrec-ecapa-voxceleb")
-        st.write(f"Selected condition: {selected_label}")
-        st.write("Embedding dimension: 192")
-        st.write("Input: mono 16 kHz")
-        st.write("Segment: 3.0 s / 48,000 samples")
-        st.write("Features: SpeechBrain FBank, 80 mel bins")
-        st.write("Realtime selection: WebRTC VAD speech-rich contiguous window")
-        st.write("Scoring: Cosine similarity")
-        configured_threshold = threshold_for_model(selected_label)
-        st.write(
-            "Threshold: "
-            + (
-                "not calibrated/configured"
-                if configured_threshold is None
-                else f"{configured_threshold:.4f}"
-            )
+                try:
+                    with st.spinner("Creating voice profile..."):
+                        enrollment_result = process_audio_bytes(
+                            verifier,
+                            enrollment_bytes,
+                            suffix=enrollment_suffix,
+                        )
+                    save_enrollment_state(
+                        st.session_state,
+                        enrollment_result,
+                        selected_model,
+                        enrollment_bytes,
+                        enrollment_mime,
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    show_processing_error("Enrollment", exc)
+    else:
+        render_enrollment_ready(
+            st.session_state["enrollment_metadata"],
+            selected_label,
         )
-        st.write(
-            "The spoken content of enrollment and verification utterances "
-            "does not need to be the same."
+        if st.session_state["enrollment_audio_bytes"]:
+            with st.expander("Play enrollment recording"):
+                st.audio(
+                    st.session_state["enrollment_audio_bytes"],
+                    format=st.session_state["enrollment_audio_mime"] or "audio/wav",
+                )
+
+    render_section_heading(
+        2,
+        "Verify Identity",
+        "Record a new voice sample. The spoken sentence does not need to match the enrollment sentence.",
+        eyebrow="Verification",
+        muted=not ready_to_verify,
+    )
+    if not ready_to_verify:
+        render_locked_verification()
+        st.info("Create a voice profile before verification.")
+        st.button("VERIFY SPEAKER", type="primary", use_container_width=True, disabled=True)
+    else:
+        verification_bytes, _, verification_suffix = render_audio_input(
+            "verification",
+            st.session_state["verification_input_version"],
         )
+        if st.button("VERIFY SPEAKER", type="primary", use_container_width=True):
+            if verification_bytes is None:
+                st.warning("Record or upload verification audio first.")
+            else:
+                try:
+                    with st.spinner("Comparing voice samples..."):
+                        verification_result = process_audio_bytes(
+                            verifier,
+                            verification_bytes,
+                            suffix=verification_suffix,
+                        )
+                        similarity = score_embeddings(
+                            st.session_state["enrollment_embedding"],
+                            verification_result.embedding,
+                        )
+                    # Each condition has its own validation-calibrated operating point.
+                    threshold = threshold_for_model(selected_label)
+                    same_speaker = decision_from_threshold(similarity, threshold)
+                    st.session_state["latest_verification_result"] = {
+                        "similarity": similarity,
+                        "threshold": threshold,
+                        "same_speaker": same_speaker,
+                        "model_label": selected_label,
+                        "metadata": verification_result.metadata,
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    show_processing_error("Verification", exc)
+
+    if latest_result is not None and ready_to_verify:
+        render_section_heading(
+            3,
+            "Verification Result",
+            "The decision uses cosine similarity and the selected model's calibrated threshold.",
+            eyebrow="Result",
+        )
+        render_result_card(
+            latest_result["similarity"],
+            latest_result["threshold"],
+            latest_result["same_speaker"],
+            latest_result.get("model_label", selected_label),
+        )
+        render_score_visualization(
+            latest_result["similarity"],
+            latest_result["threshold"],
+        )
+        with st.expander("Verification sample details"):
+            render_sample_details(latest_result["metadata"])
+
+    if ready_to_verify:
+        st.divider()
+        action_columns = st.columns(2)
+        with action_columns[0]:
+            if st.button("Clear enrollment", use_container_width=True):
+                clear_enrollment_state(st.session_state)
+                st.rerun()
+        with action_columns[1]:
+            if st.button(
+                "Verify again",
+                use_container_width=True,
+                disabled=latest_result is None,
+            ):
+                reset_verification_state(st.session_state)
+                st.rerun()
 
 
 if __name__ == "__main__":

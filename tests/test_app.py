@@ -13,6 +13,7 @@ import app
 from src.audio import AudioLoadError, SpeechWindowMetadata, decode_audio
 from src.inference import RealtimeEmbedding
 from src.model import EMBEDDING_DIM
+from ui.components import metadata_rows
 
 
 def make_metadata() -> SpeechWindowMetadata:
@@ -103,8 +104,44 @@ class AppStateTests(unittest.TestCase):
         )
         self.assertFalse(app.enrollment_is_ready(state, "model.pt"))
 
+    def test_verify_again_retains_enrollment_and_resets_input(self) -> None:
+        state: dict[str, object] = {}
+        app.initialize_session_state(state)
+        state.update(
+            enrollment_saved=True,
+            enrollment_embedding=make_embedding(),
+            latest_verification_result={"similarity": 1.0},
+        )
+        initial_version = state["verification_input_version"]
+
+        app.reset_verification_state(state)
+
+        self.assertTrue(state["enrollment_saved"])
+        self.assertIsNotNone(state["enrollment_embedding"])
+        self.assertIsNone(state["latest_verification_result"])
+        self.assertEqual(state["verification_input_version"], initial_version + 1)
+
 
 class AppHelperTests(unittest.TestCase):
+    def test_metadata_rows_only_show_vad_measurements_when_used(self) -> None:
+        realtime_rows = dict(metadata_rows(make_metadata()))
+        self.assertEqual(realtime_rows["Recording duration"], "5.00 s")
+        self.assertEqual(realtime_rows["Detected speech"], "3.50 s")
+        self.assertEqual(realtime_rows["Selected model segment"], "1.00–4.00 s")
+
+        exact_window = SpeechWindowMetadata(
+            original_duration_seconds=3.0,
+            selected_start_seconds=0.0,
+            selected_end_seconds=3.0,
+            speech_in_selected_window_seconds=0.0,
+            total_speech_seconds=0.0,
+            sufficient_speech=True,
+            vad_used=False,
+        )
+        exact_rows = dict(metadata_rows(exact_window))
+        self.assertNotIn("Detected speech", exact_rows)
+        self.assertNotIn("Speech in selected segment", exact_rows)
+
     def test_checkpoint_discovery_is_recursive_and_suffix_limited(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
