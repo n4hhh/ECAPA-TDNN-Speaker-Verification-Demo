@@ -16,7 +16,12 @@ from src.model import (
     build_model_from_checkpoint,
     validate_checkpoint,
 )
-from src.model_thresholds import MODEL_THRESHOLDS, threshold_for_model
+from src.model_thresholds import (
+    MODEL_THRESHOLDS,
+    SINGLE_WINDOW_MODEL_THRESHOLDS,
+    single_window_threshold_for_model,
+    threshold_for_model,
+)
 
 
 class FakeFeatures(nn.Module):
@@ -83,6 +88,11 @@ class CheckpointValidationTests(unittest.TestCase):
             },
         )
         self.assertEqual(threshold_for_model("adaptive"), MODEL_THRESHOLDS["ADAPTIVE"])
+        self.assertIs(MODEL_THRESHOLDS, SINGLE_WINDOW_MODEL_THRESHOLDS)
+        self.assertEqual(
+            single_window_threshold_for_model("adaptive"),
+            MODEL_THRESHOLDS["ADAPTIVE"],
+        )
 
     def test_new_checkpoint_schema_is_accepted(self) -> None:
         metadata = validate_checkpoint(checkpoint())

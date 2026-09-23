@@ -21,8 +21,11 @@ Enrollment -> Verification -> Result
    default when its checkpoint is available.
 2. Create a session-only voice profile from the microphone or a WAV/MP3 upload.
 3. Record or upload a second, text-independent verification sample.
-4. Review the SAME/DIFFERENT decision, cosine similarity, calibrated threshold,
-   selected model, and the real preprocessing timings reported by the backend.
+4. Review the aggregated cosine similarity, selected model, and real
+   multi-segment preprocessing timings reported by the backend.
+
+The current multi-segment Streamlit protocol does not issue a SAME/DIFFERENT
+decision because a matching operational threshold has not yet been calibrated.
 
 Changing the model clears the model-specific enrollment. **Verify again** clears
 only the latest verification result and input, while **Clear enrollment** removes
@@ -69,7 +72,9 @@ The checkpoints may also contain `aam_state_dict`, optimizer, scheduler, scaler,
 and RNG state. AAM-Softmax is training-only; verification does not construct or
 use the AAM head.
 
-## Inference Pipeline
+## Inference Protocols
+
+Both protocols share the frozen model frontend:
 
 ```text
 audio
@@ -84,25 +89,59 @@ audio
 -> cosine similarity
 ```
 
-Exact 48,000-sample mono/16 kHz input is used directly. The current realtime
-long-recording path is explicitly:
+### Historical / Single-Window Realtime
+
+The historical public API remains available unchanged:
 
 ```text
-WebRTC VAD
--> one speech-rich contiguous 3-second window
+long recording
+-> mono 16 kHz
+-> WebRTC VAD
+-> best speech-rich contiguous 3-second window
 -> ECAPA embedding
+-> single-window calibrated threshold
 ```
 
-It does not perform multi-segment inference or embedding aggregation. Separated
-speech fragments are never concatenated. Too-short or insufficient-speech
-recordings are rejected with a clear validation error.
+Exact 48,000-sample mono/16 kHz historical inputs still bypass VAD and are used
+directly. `extract_embedding_realtime()` retains this frozen behavior.
+
+### Current Streamlit Multi-Segment Demo
+
+Both enrollment and verification use:
+
+```text
+long recording
+-> mono 16 kHz
+-> WebRTC VAD
+-> overlapping contiguous 3-second windows, 1.5-second hop
+-> retain every window with >=1.5 seconds detected speech
+-> one batched ECAPA inference call
+-> arithmetic mean of segment embeddings
+-> L2 normalization
+-> one aggregated 192-D embedding
+-> cosine similarity
+```
+
+The hard input rules are:
+
+- no more than 20.0 seconds recording duration;
+- at least 3.0 seconds total detected speech;
+- at least two valid windows;
+- only complete 48,000-sample windows are used;
+- an incomplete tail shorter than three seconds is discarded;
+- separated speech regions are never concatenated or padded together.
+
+The UI recommends approximately 8–10 seconds of natural speech to make it easy
+to satisfy these rules. Candidate windows are supplied to ECAPA as a single
+`[N, 48000]` batch. Each returned 192-D embedding is already normalized; their
+arithmetic mean is L2-normalized again to create the session embedding.
 
 Cosine similarity is not a probability or confidence percentage.
 
 ## Thresholds And Decisions
 
 `src/model_thresholds.py` contains validation-calibrated empirical EER operating
-points for all three thesis conditions:
+points for the historical single-window protocol:
 
 | Model | Decision threshold |
 | --- | ---: |
@@ -110,11 +149,13 @@ points for all three thesis conditions:
 | RANDOM | `0.16918502748012543` |
 | ADAPTIVE | `0.172615185379982` |
 
-The selected model's threshold is applied without modification using
-`similarity >= threshold`. Threshold selection does not use final-test data. If
-an additional compatible checkpoint has no configured threshold, the UI keeps
-the score visible but reports **Decision unavailable** instead of borrowing
-another model's operating point.
+Historical callers apply the selected model's threshold without modification
+using `similarity >= threshold`. Threshold selection did not use final-test data.
+
+**No multi-segment operational threshold has yet been calibrated.** The
+Streamlit app does not reuse the values above, invent a replacement, or produce
+a SAME/DIFFERENT decision. It displays the aggregated cosine similarity and
+reports **Threshold: Not calibrated** and **Decision: Unavailable**.
 
 ## Setup
 
@@ -144,7 +185,8 @@ streamlit run app.py
 ```
 
 The app supports browser microphone recording, WAV upload, and MP3 upload when
-the local audio stack can decode MP3.
+the local audio stack can decode MP3. Record approximately 8–10 seconds of
+natural speech for both enrollment and verification.
 
 ## Diagnostics
 
@@ -186,11 +228,11 @@ python -m scripts.verify_pair enrollment.wav verification.wav --threshold 0.5
 app.py              Streamlit workflow, checkpoint selection, and session state
 ui/components.py    reusable presentation-only UI components
 ui/styles.css       local responsive visual design
-src/audio.py        decoding, model preprocessing, realtime segment selection
+src/audio.py        decoding and distinct single-/multi-segment preprocessing
 src/model.py        checkpoint validation and strict ECAPA construction
-src/inference.py    embedding extraction and cosine scoring
+src/inference.py    batched extraction, mean aggregation, and cosine scoring
 src/vad.py          WebRTC speech activity detection
-src/model_thresholds.py  validation-calibrated per-model threshold mapping
+src/model_thresholds.py  historical single-window threshold mapping
 scripts/           diagnostics and CLI verification
 tests/             unit tests that avoid requiring huge real checkpoints
 ```

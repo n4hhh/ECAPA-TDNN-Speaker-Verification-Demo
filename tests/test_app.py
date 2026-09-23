@@ -10,10 +10,16 @@ import soundfile as sf
 import torch
 
 import app
-from src.audio import AudioLoadError, SpeechWindowMetadata, decode_audio
-from src.inference import RealtimeEmbedding
+from src.audio import (
+    AudioLoadError,
+    MultiSegmentMetadata,
+    SpeechWindowMetadata,
+    ValidSegmentMetadata,
+    decode_audio,
+)
+from src.inference import MultiSegmentEmbedding, RealtimeEmbedding
 from src.model import EMBEDDING_DIM
-from ui.components import metadata_rows
+from ui.components import metadata_rows, multisegment_metadata_rows, render_result_card
 
 
 def make_metadata() -> SpeechWindowMetadata:
@@ -31,6 +37,23 @@ def make_embedding() -> torch.Tensor:
     embedding = torch.zeros(EMBEDDING_DIM)
     embedding[0] = 1.0
     return embedding
+
+
+def make_multisegment_metadata() -> MultiSegmentMetadata:
+    return MultiSegmentMetadata(
+        original_duration_seconds=8.5,
+        total_speech_seconds=7.0,
+        candidate_window_count=4,
+        valid_window_count=3,
+        window_seconds=3.0,
+        hop_seconds=1.5,
+        valid_segments=(
+            ValidSegmentMetadata(0.0, 3.0, 2.8),
+            ValidSegmentMetadata(1.5, 4.5, 2.7),
+            ValidSegmentMetadata(4.5, 7.5, 2.6),
+        ),
+        sufficient_speech=True,
+    )
 
 
 class AppStateTests(unittest.TestCase):
@@ -76,6 +99,41 @@ class AppStateTests(unittest.TestCase):
         self.assertFalse(app.activate_model(state, "model.pt"))
         self.assertTrue(app.enrollment_is_ready(state, "model.pt"))
         self.assertEqual(state["latest_verification_result"], {"similarity": 1.0})
+
+    def test_enrollment_stores_aggregated_embedding_and_metadata(self) -> None:
+        state: dict[str, object] = {}
+        app.initialize_session_state(state)
+        app.activate_model(state, "model.pt")
+        aggregate = make_embedding()
+        metadata = make_multisegment_metadata()
+
+        app.save_enrollment_state(
+            state,
+            MultiSegmentEmbedding(aggregate, metadata),
+            "model.pt",
+            b"wav",
+            "audio/wav",
+        )
+
+        self.assertTrue(torch.equal(state["enrollment_embedding"], aggregate))
+        self.assertEqual(state["enrollment_metadata"], metadata)
+        self.assertTrue(app.enrollment_is_ready(state, "model.pt"))
+        self.assertTrue(app.multisegment_enrollment_is_ready(state, "model.pt"))
+
+    def test_historical_enrollment_is_not_reused_by_multisegment_app(self) -> None:
+        state: dict[str, object] = {}
+        app.initialize_session_state(state)
+        app.activate_model(state, "model.pt")
+        app.save_enrollment_state(
+            state,
+            RealtimeEmbedding(make_embedding(), make_metadata()),
+            "model.pt",
+            b"wav",
+            "audio/wav",
+        )
+
+        self.assertTrue(app.enrollment_is_ready(state, "model.pt"))
+        self.assertFalse(app.multisegment_enrollment_is_ready(state, "model.pt"))
 
     def test_clear_removes_enrollment_audio_and_result(self) -> None:
         state: dict[str, object] = {}
@@ -123,6 +181,14 @@ class AppStateTests(unittest.TestCase):
 
 
 class AppHelperTests(unittest.TestCase):
+    def test_multisegment_metadata_rows_use_real_backend_values(self) -> None:
+        rows = dict(multisegment_metadata_rows(make_multisegment_metadata()))
+        self.assertEqual(rows["Recording duration"], "8.50 s")
+        self.assertEqual(rows["Detected speech"], "7.00 s")
+        self.assertEqual(rows["Candidate windows"], "4")
+        self.assertEqual(rows["Valid segments"], "3")
+        self.assertEqual(rows["Window / hop"], "3.0 s / 1.5 s")
+
     def test_metadata_rows_only_show_vad_measurements_when_used(self) -> None:
         realtime_rows = dict(metadata_rows(make_metadata()))
         self.assertEqual(realtime_rows["Recording duration"], "5.00 s")
@@ -181,6 +247,45 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(verifier.extract_embedding_realtime.call_count, 2)
         self.assertEqual(seen_suffixes, [".wav", ".mp3"])
         self.assertTrue(torch.equal(first.embedding, second.embedding))
+
+    def test_app_multisegment_audio_uses_explicit_multisegment_method(self) -> None:
+        verifier = Mock()
+
+        def inspect_temporary_file(path: Path) -> MultiSegmentEmbedding:
+            self.assertEqual(Path(path).read_bytes(), b"RIFF-test")
+            return MultiSegmentEmbedding(make_embedding(), make_multisegment_metadata())
+
+        verifier.extract_embedding_multisegment.side_effect = inspect_temporary_file
+        result = app.process_audio_bytes_multisegment(verifier, b"RIFF-test")
+        verifier.extract_embedding_multisegment.assert_called_once()
+        verifier.extract_embedding_realtime.assert_not_called()
+        self.assertEqual(result.metadata.valid_window_count, 3)
+
+    def test_app_scores_aggregates_without_threshold_or_decision(self) -> None:
+        verification_embedding = torch.zeros(EMBEDDING_DIM)
+        verification_embedding[0] = 0.8
+        verification_embedding[1] = 0.6
+        result = app.build_multisegment_verification_result(
+            make_embedding(),
+            MultiSegmentEmbedding(
+                verification_embedding,
+                make_multisegment_metadata(),
+            ),
+            "ADAPTIVE",
+        )
+        self.assertAlmostEqual(result["similarity"], 0.8)
+        self.assertIsNone(result["threshold"])
+        self.assertIsNone(result["same_speaker"])
+
+    @patch("ui.components.st.html")
+    def test_neutral_result_does_not_claim_same_or_different_speaker(self, html_mock) -> None:
+        render_result_card(0.4281, None, None, "ADAPTIVE")
+        rendered = "".join(call.args[0] for call in html_mock.call_args_list)
+        self.assertIn("Speaker Similarity", rendered)
+        self.assertIn("Not calibrated", rendered)
+        self.assertIn("NOT AVAILABLE", rendered)
+        self.assertNotIn("Identity Match", rendered)
+        self.assertNotIn("Identity Not Matched", rendered)
 
     def test_empty_audio_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "empty"):

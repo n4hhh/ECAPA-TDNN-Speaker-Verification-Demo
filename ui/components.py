@@ -9,7 +9,7 @@ from typing import Optional
 
 import streamlit as st
 
-from src.audio import SpeechWindowMetadata
+from src.audio import MultiSegmentMetadata, SpeechWindowMetadata
 
 STYLES_PATH = Path(__file__).with_name("styles.css")
 
@@ -105,6 +105,23 @@ def metadata_rows(metadata: SpeechWindowMetadata) -> tuple[tuple[str, str], ...]
     return tuple(rows)
 
 
+def multisegment_metadata_rows(
+    metadata: MultiSegmentMetadata,
+) -> tuple[tuple[str, str], ...]:
+    """Return display values measured by the multi-segment backend."""
+
+    return (
+        ("Recording duration", f"{metadata.original_duration_seconds:.2f} s"),
+        ("Detected speech", f"{metadata.total_speech_seconds:.2f} s"),
+        ("Candidate windows", str(metadata.candidate_window_count)),
+        ("Valid segments", str(metadata.valid_window_count)),
+        (
+            "Window / hop",
+            f"{metadata.window_seconds:.1f} s / {metadata.hop_seconds:.1f} s",
+        ),
+    )
+
+
 def _metadata_grid(metadata: SpeechWindowMetadata) -> str:
     return "".join(
         '<div class="metadata-item">'
@@ -114,7 +131,16 @@ def _metadata_grid(metadata: SpeechWindowMetadata) -> str:
     )
 
 
-def render_enrollment_ready(metadata: SpeechWindowMetadata, model_label: str) -> None:
+def _multisegment_metadata_grid(metadata: MultiSegmentMetadata) -> str:
+    return "".join(
+        '<div class="metadata-item">'
+        f'<span>{html.escape(label)}</span><strong>{html.escape(value)}</strong>'
+        "</div>"
+        for label, value in multisegment_metadata_rows(metadata)
+    )
+
+
+def render_enrollment_ready(metadata: MultiSegmentMetadata, model_label: str) -> None:
     st.html(
         f"""
         <section class="status-card status-card-success">
@@ -122,9 +148,9 @@ def render_enrollment_ready(metadata: SpeechWindowMetadata, model_label: str) ->
           <div class="status-copy">
             <div class="status-overline">CURRENT SESSION · {html.escape(model_label)}</div>
             <h3>Voice profile ready</h3>
-            <p>Your enrollment is ready for a new verification sample.</p>
+            <p>{metadata.valid_window_count} valid segments were aggregated into one voice profile.</p>
           </div>
-          <div class="metadata-grid">{_metadata_grid(metadata)}</div>
+          <div class="metadata-grid">{_multisegment_metadata_grid(metadata)}</div>
         </section>
         """
     )
@@ -195,11 +221,11 @@ def render_result_card(
     else:
         style = "unavailable"
         icon = "—"
-        title = "Decision Unavailable"
-        detail = "A validation-calibrated threshold is not configured for this model."
+        title = "Speaker Similarity"
+        detail = "Multi-segment threshold calibration is pending."
         decision = "NOT AVAILABLE"
 
-    threshold_text = "Not configured" if threshold is None else f"{threshold:.4f}"
+    threshold_text = "Not calibrated" if threshold is None else f"{threshold:.4f}"
     st.html(
         f"""
         <section class="result-card result-{style}">
@@ -221,12 +247,35 @@ def render_result_card(
     )
 
 
-def render_sample_details(metadata: SpeechWindowMetadata) -> None:
+def render_sample_details(metadata: MultiSegmentMetadata) -> None:
+    segment_rows = "".join(
+        "<tr>"
+        f"<td>Segment {index}</td>"
+        f"<td>{segment.start_seconds:.2f}–{segment.end_seconds:.2f} s</td>"
+        f"<td>{segment.speech_seconds:.2f} s speech</td>"
+        "</tr>"
+        for index, segment in enumerate(metadata.valid_segments, start=1)
+    )
     st.html(
         f"""
         <div class="sample-details">
-          <div class="sample-details-title">Verification sample processing</div>
-          <div class="metadata-grid">{_metadata_grid(metadata)}</div>
+          <div class="metadata-grid">{_multisegment_metadata_grid(metadata)}</div>
+          <div class="sample-details-title segment-title">Retained contiguous segments</div>
+          <table class="segment-table">
+            <thead><tr><th>Segment</th><th>Range</th><th>Detected speech</th></tr></thead>
+            <tbody>{segment_rows}</tbody>
+          </table>
+        </div>
+        """
+    )
+
+
+def render_calibration_note() -> None:
+    st.html(
+        """
+        <div class="calibration-note">
+          The current calibrated operating points belong to the historical
+          single-window protocol and are not reused for multi-segment inference.
         </div>
         """
     )
@@ -241,4 +290,3 @@ def render_privacy_note() -> None:
         </div>
         """
     )
-

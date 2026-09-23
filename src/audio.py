@@ -24,6 +24,30 @@ INSUFFICIENT_SPEECH_MESSAGE = (
     "Not enough speech detected. Please speak for a few seconds and try again."
 )
 
+# The Streamlit demo's multi-segment protocol is intentionally separate from the
+# historical single-window constants above.
+MULTISEGMENT_WINDOW_SECONDS = SEGMENT_SECONDS
+MULTISEGMENT_WINDOW_SAMPLES = SEGMENT_SAMPLES
+MULTISEGMENT_HOP_SECONDS = 1.5
+MULTISEGMENT_HOP_SAMPLES = int(TARGET_SAMPLE_RATE * MULTISEGMENT_HOP_SECONDS)
+MULTISEGMENT_MIN_SPEECH_PER_WINDOW_SECONDS = 1.5
+MULTISEGMENT_MIN_SPEECH_PER_WINDOW_SAMPLES = int(
+    TARGET_SAMPLE_RATE * MULTISEGMENT_MIN_SPEECH_PER_WINDOW_SECONDS
+)
+MULTISEGMENT_MIN_TOTAL_SPEECH_SECONDS = 3.0
+MULTISEGMENT_MIN_VALID_WINDOWS = 2
+MULTISEGMENT_MAX_RECORDING_SECONDS = 20.0
+
+RECORDING_TOO_LONG_MESSAGE = (
+    "Recording is longer than 20 seconds. Please record a shorter sample."
+)
+MULTISEGMENT_INSUFFICIENT_SPEECH_MESSAGE = (
+    "Not enough speech detected. Please speak naturally for at least a few seconds."
+)
+INSUFFICIENT_VALID_SEGMENTS_MESSAGE = (
+    "Not enough usable speech segments were found. Please speak for longer and try again."
+)
+
 PathLike = Union[str, Path]
 
 
@@ -54,12 +78,65 @@ class PreparedAudio:
     metadata: SpeechWindowMetadata
 
 
+@dataclass(frozen=True)
+class ValidSegmentMetadata:
+    """Timing and detected-speech duration for one retained model window."""
+
+    start_seconds: float
+    end_seconds: float
+    speech_seconds: float
+
+
+@dataclass(frozen=True)
+class MultiSegmentMetadata:
+    """Measured properties of one multi-segment realtime recording."""
+
+    original_duration_seconds: float
+    total_speech_seconds: float
+    candidate_window_count: int
+    valid_window_count: int
+    window_seconds: float
+    hop_seconds: float
+    valid_segments: tuple[ValidSegmentMetadata, ...]
+    sufficient_speech: bool
+    vad_used: bool = True
+    multisegment_used: bool = True
+
+
+@dataclass(frozen=True)
+class PreparedMultiSegmentAudio:
+    """A batch of valid contiguous model windows plus selection metadata."""
+
+    windows: torch.Tensor
+    metadata: MultiSegmentMetadata
+
+
 class InsufficientSpeechError(AudioValidationError):
     """Raised when realtime quality requirements are not met."""
 
     def __init__(self, metadata: SpeechWindowMetadata) -> None:
         super().__init__(INSUFFICIENT_SPEECH_MESSAGE)
         self.metadata = metadata
+
+
+class RecordingTooLongError(AudioValidationError):
+    """Raised when multi-segment input exceeds the realtime duration limit."""
+
+
+class MultiSegmentSpeechError(AudioValidationError):
+    """Base class for multi-segment validation failures with measured metadata."""
+
+    def __init__(self, message: str, metadata: MultiSegmentMetadata) -> None:
+        super().__init__(message)
+        self.metadata = metadata
+
+
+class InsufficientMultiSegmentSpeechError(MultiSegmentSpeechError):
+    """Raised when the whole recording contains too little detected speech."""
+
+
+class InsufficientValidSegmentsError(MultiSegmentSpeechError):
+    """Raised when fewer than two candidate windows pass speech filtering."""
 
 
 def _validate_waveform(waveform: torch.Tensor, *, context: str) -> None:
@@ -321,3 +398,141 @@ def prepare_audio_realtime(
 def load_audio_realtime(path: PathLike) -> PreparedAudio:
     waveform, sample_rate = decode_audio(path)
     return prepare_audio_realtime(waveform, sample_rate)
+
+
+def multisegment_window_starts(num_samples: int) -> tuple[int, ...]:
+    """Return deterministic starts for complete 3-second windows at 1.5-second hops."""
+
+    if isinstance(num_samples, bool) or not isinstance(num_samples, int) or num_samples < 0:
+        raise ValueError("num_samples must be a non-negative integer.")
+    if num_samples < MULTISEGMENT_WINDOW_SAMPLES:
+        return ()
+    return tuple(
+        range(
+            0,
+            num_samples - MULTISEGMENT_WINDOW_SAMPLES + 1,
+            MULTISEGMENT_HOP_SAMPLES,
+        )
+    )
+
+
+def select_multisegment_windows(
+    waveform: torch.Tensor,
+    sample_rate: int = TARGET_SAMPLE_RATE,
+    *,
+    speech_activity: Optional[SpeechActivity] = None,
+    original_duration_seconds: Optional[float] = None,
+) -> PreparedMultiSegmentAudio:
+    """Retain every complete contiguous window meeting the speech requirement."""
+
+    _validate_sample_rate(sample_rate)
+    _validate_waveform(waveform, context="multi-segment waveform")
+    if waveform.ndim != 1:
+        raise AudioValidationError("Multi-segment selection requires mono audio.")
+    if sample_rate != TARGET_SAMPLE_RATE:
+        raise AudioValidationError(
+            f"Multi-segment selection requires {TARGET_SAMPLE_RATE} Hz audio."
+        )
+
+    duration = (
+        waveform.numel() / sample_rate
+        if original_duration_seconds is None
+        else original_duration_seconds
+    )
+    if duration > MULTISEGMENT_MAX_RECORDING_SECONDS:
+        raise RecordingTooLongError(RECORDING_TOO_LONG_MESSAGE)
+
+    activity = speech_activity or detect_speech_activity(waveform, sample_rate)
+    _validate_activity(activity, waveform.numel())
+    activity_mask = speech_sample_mask(activity)
+    total_speech_samples = int(activity_mask.sum().item())
+    starts = multisegment_window_starts(waveform.numel())
+
+    # Prefix sums count VAD-positive samples in every candidate without modifying
+    # or joining waveform regions. Retained windows remain exact contiguous slices.
+    cumulative = F.pad(activity_mask.to(torch.int64).cumsum(dim=0), (1, 0))
+    valid_starts: list[int] = []
+    valid_segments: list[ValidSegmentMetadata] = []
+    for start in starts:
+        stop = start + MULTISEGMENT_WINDOW_SAMPLES
+        speech_samples = int((cumulative[stop] - cumulative[start]).item())
+        if speech_samples >= MULTISEGMENT_MIN_SPEECH_PER_WINDOW_SAMPLES:
+            valid_starts.append(start)
+            valid_segments.append(
+                ValidSegmentMetadata(
+                    start_seconds=start / sample_rate,
+                    end_seconds=stop / sample_rate,
+                    speech_seconds=speech_samples / sample_rate,
+                )
+            )
+
+    total_speech_seconds = total_speech_samples / sample_rate
+    sufficient = (
+        total_speech_seconds >= MULTISEGMENT_MIN_TOTAL_SPEECH_SECONDS
+        and len(valid_starts) >= MULTISEGMENT_MIN_VALID_WINDOWS
+    )
+    metadata = MultiSegmentMetadata(
+        original_duration_seconds=duration,
+        total_speech_seconds=total_speech_seconds,
+        candidate_window_count=len(starts),
+        valid_window_count=len(valid_starts),
+        window_seconds=MULTISEGMENT_WINDOW_SECONDS,
+        hop_seconds=MULTISEGMENT_HOP_SECONDS,
+        valid_segments=tuple(valid_segments),
+        sufficient_speech=sufficient,
+    )
+    if total_speech_seconds < MULTISEGMENT_MIN_TOTAL_SPEECH_SECONDS:
+        raise InsufficientMultiSegmentSpeechError(
+            MULTISEGMENT_INSUFFICIENT_SPEECH_MESSAGE,
+            metadata,
+        )
+    if len(valid_starts) < MULTISEGMENT_MIN_VALID_WINDOWS:
+        raise InsufficientValidSegmentsError(
+            INSUFFICIENT_VALID_SEGMENTS_MESSAGE,
+            metadata,
+        )
+
+    windows = torch.stack(
+        [
+            waveform[start : start + MULTISEGMENT_WINDOW_SAMPLES]
+            for start in valid_starts
+        ]
+    ).contiguous()
+    expected_shape = (len(valid_starts), MULTISEGMENT_WINDOW_SAMPLES)
+    if windows.shape != expected_shape:
+        raise AudioValidationError(
+            f"Multi-segment windows have shape {tuple(windows.shape)}; "
+            f"expected {expected_shape}."
+        )
+    if not torch.isfinite(windows).all():
+        raise AudioValidationError("Multi-segment windows contain NaN or infinite samples.")
+    return PreparedMultiSegmentAudio(windows=windows, metadata=metadata)
+
+
+def prepare_audio_multisegment(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    *,
+    speech_activity: Optional[SpeechActivity] = None,
+) -> PreparedMultiSegmentAudio:
+    """Convert arbitrary decoded audio and prepare the multi-segment batch."""
+
+    _validate_sample_rate(sample_rate)
+    _validate_waveform(waveform, context="waveform")
+    original_duration_seconds = waveform.shape[-1] / sample_rate
+    if original_duration_seconds > MULTISEGMENT_MAX_RECORDING_SECONDS:
+        raise RecordingTooLongError(RECORDING_TOO_LONG_MESSAGE)
+    mono = convert_to_mono_16k(waveform, sample_rate)
+    return select_multisegment_windows(
+        mono,
+        TARGET_SAMPLE_RATE,
+        speech_activity=speech_activity,
+        original_duration_seconds=original_duration_seconds,
+    )
+
+
+def load_audio_multisegment(path: PathLike) -> PreparedMultiSegmentAudio:
+    """Decode a file and prepare all valid multi-segment model windows."""
+
+    waveform, sample_rate = decode_audio(path)
+    return prepare_audio_multisegment(waveform, sample_rate)

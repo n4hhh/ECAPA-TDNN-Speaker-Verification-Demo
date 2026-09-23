@@ -4,25 +4,32 @@ from __future__ import annotations
 
 import logging
 import tempfile
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 
 import soundfile as sf
 import streamlit as st
 import torch
 
-from src.audio import AudioLoadError, AudioValidationError, InsufficientSpeechError
+from src.audio import (
+    AudioLoadError,
+    AudioValidationError,
+    InsufficientSpeechError,
+    MultiSegmentMetadata,
+    MultiSegmentSpeechError,
+    RecordingTooLongError,
+)
 from src.inference import (
+    MultiSegmentEmbedding,
     RealtimeEmbedding,
     SpeakerVerifier,
-    decision_from_threshold,
     score_embeddings,
 )
 from src.model import CheckpointCompatibilityError, load_checkpoint, validate_checkpoint
-from src.model_thresholds import threshold_for_model
 from ui.components import (
     load_styles,
+    render_calibration_note,
     render_enrollment_ready,
     render_header,
     render_locked_verification,
@@ -35,6 +42,7 @@ from ui.components import (
 )
 
 LOGGER = logging.getLogger("speaker_verification_demo")
+EmbeddingResult = TypeVar("EmbeddingResult")
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHECKPOINT_DIRECTORY = PROJECT_ROOT / "checkpoints"
 CHECKPOINT_SUFFIXES = {".pt", ".pth"}
@@ -132,9 +140,23 @@ def enrollment_is_ready(state: MutableMapping[str, Any], model_path: str) -> boo
     )
 
 
+def multisegment_enrollment_is_ready(
+    state: MutableMapping[str, Any],
+    model_path: str,
+) -> bool:
+    """Reject stale session enrollments created by the historical protocol."""
+
+    metadata = state.get("enrollment_metadata")
+    return bool(
+        enrollment_is_ready(state, model_path)
+        and isinstance(metadata, MultiSegmentMetadata)
+        and metadata.multisegment_used
+    )
+
+
 def save_enrollment_state(
     state: MutableMapping[str, Any],
-    result: RealtimeEmbedding,
+    result: RealtimeEmbedding | MultiSegmentEmbedding,
     model_path: str,
     audio_bytes: bytes,
     audio_mime: str,
@@ -224,13 +246,13 @@ def mp3_decoder_available() -> bool:
     )
 
 
-def process_audio_bytes(
-    verifier: SpeakerVerifier,
+def _process_audio_bytes_with_extractor(
+    extractor: Callable[[Path], EmbeddingResult],
     audio_bytes: bytes,
     *,
     suffix: str = ".wav",
-) -> RealtimeEmbedding:
-    """Route browser/upload bytes through the existing realtime file pipeline."""
+) -> EmbeddingResult:
+    """Bridge browser bytes to one of the explicit file-based inference protocols."""
 
     if not audio_bytes:
         raise AudioValidationError("The selected audio file is empty.")
@@ -246,11 +268,57 @@ def process_audio_bytes(
         audio_path = Path(temp_name) / f"input{normalized_suffix}"
         audio_path.write_bytes(audio_bytes)
         try:
-            return verifier.extract_embedding_realtime(audio_path)
+            return extractor(audio_path)
         except AudioLoadError as exc:
             if normalized_suffix == ".mp3":
                 raise Mp3DecodeError(MP3_DECODE_ERROR_MESSAGE) from exc
             raise
+
+
+def process_audio_bytes(
+    verifier: SpeakerVerifier,
+    audio_bytes: bytes,
+    *,
+    suffix: str = ".wav",
+) -> RealtimeEmbedding:
+    """Run the historical single-window realtime protocol."""
+
+    return _process_audio_bytes_with_extractor(
+        verifier.extract_embedding_realtime,
+        audio_bytes,
+        suffix=suffix,
+    )
+
+
+def process_audio_bytes_multisegment(
+    verifier: SpeakerVerifier,
+    audio_bytes: bytes,
+    *,
+    suffix: str = ".wav",
+) -> MultiSegmentEmbedding:
+    """Run the Streamlit demo's multi-segment realtime protocol."""
+
+    return _process_audio_bytes_with_extractor(
+        verifier.extract_embedding_multisegment,
+        audio_bytes,
+        suffix=suffix,
+    )
+
+
+def build_multisegment_verification_result(
+    enrollment_embedding: torch.Tensor,
+    verification: MultiSegmentEmbedding,
+    model_label: str,
+) -> dict[str, Any]:
+    """Score aggregated vectors without applying single-window thresholds."""
+
+    return {
+        "similarity": score_embeddings(enrollment_embedding, verification.embedding),
+        "threshold": None,
+        "same_speaker": None,
+        "model_label": model_label,
+        "metadata": verification.metadata,
+    }
 
 
 def render_audio_input(
@@ -270,7 +338,7 @@ def render_audio_input(
             "Record a voice sample",
             sample_rate=16_000,
             key=f"{section}_microphone_{version}",
-            help="Speak naturally for several seconds.",
+            help="For best coverage, speak naturally for approximately 8–10 seconds.",
         )
     else:
         value = st.file_uploader(
@@ -298,6 +366,8 @@ def show_processing_error(context: str, exc: Exception) -> None:
     LOGGER.warning("%s failed", context, exc_info=True)
     if isinstance(exc, Mp3DecodeError):
         st.error(MP3_DECODE_ERROR_MESSAGE)
+    elif isinstance(exc, (RecordingTooLongError, MultiSegmentSpeechError)):
+        st.error(str(exc))
     elif isinstance(exc, InsufficientSpeechError):
         st.error(str(exc))
     elif isinstance(exc, FileNotFoundError):
@@ -355,7 +425,6 @@ def _render_sidebar(
             key="model_selector",
         )
         selected_label = _model_label(selected_model)
-        configured_threshold = threshold_for_model(selected_label)
         st.caption(f"Checkpoint: `{Path(selected_model).name}`")
         with st.expander("Advanced / Technical details"):
             st.markdown(
@@ -364,11 +433,13 @@ def _render_sidebar(
                 - **Base:** speechbrain/spkrec-ecapa-voxceleb
                 - **Embedding:** 192-D, L2 normalized
                 - **Audio input:** mono, 16 kHz
-                - **Model input:** one 3.0-second window
+                - **Model input:** overlapping 3.0-second windows
+                - **Window hop:** 1.5 seconds
                 - **Features:** SpeechBrain FBank, 80 Mel bins
-                - **Realtime selection:** WebRTC VAD, contiguous speech-rich window
+                - **Realtime selection:** all qualifying contiguous VAD windows
+                - **Aggregation:** arithmetic mean, then L2 normalization
                 - **Scoring:** cosine similarity
-                - **Threshold:** {"Not configured" if configured_threshold is None else f"{configured_threshold:.4f}"}
+                - **Multi-segment threshold:** not calibrated
                 - **Training condition:** {selected_label}
                 """
             )
@@ -433,7 +504,7 @@ def main() -> None:
     if enrollment_invalidated:
         st.info("Model changed. Create a new voice profile for this model.")
 
-    ready_to_verify = enrollment_is_ready(st.session_state, selected_model)
+    ready_to_verify = multisegment_enrollment_is_ready(st.session_state, selected_model)
     latest_result = st.session_state.get("latest_verification_result")
     current_step = (
         3 if latest_result is not None and ready_to_verify else 2 if ready_to_verify else 1
@@ -443,7 +514,7 @@ def main() -> None:
     render_section_heading(
         1,
         "Create Voice Profile",
-        "Speak naturally for several seconds. Your sample is used only for the current demo session.",
+        "Speak naturally for approximately 8–10 seconds. Recordings must be no longer than 20 seconds.",
         eyebrow="Enrollment",
     )
     if not ready_to_verify:
@@ -458,7 +529,7 @@ def main() -> None:
             else:
                 try:
                     with st.spinner("Creating voice profile..."):
-                        enrollment_result = process_audio_bytes(
+                        enrollment_result = process_audio_bytes_multisegment(
                             verifier,
                             enrollment_bytes,
                             suffix=enrollment_suffix,
@@ -484,11 +555,13 @@ def main() -> None:
                     st.session_state["enrollment_audio_bytes"],
                     format=st.session_state["enrollment_audio_mime"] or "audio/wav",
                 )
+        with st.expander("Enrollment segment details"):
+            render_sample_details(st.session_state["enrollment_metadata"])
 
     render_section_heading(
         2,
         "Verify Identity",
-        "Record a new voice sample. The spoken sentence does not need to match the enrollment sentence.",
+        "Record 8–10 seconds of natural speech. The sentence does not need to match enrollment.",
         eyebrow="Verification",
         muted=not ready_to_verify,
     )
@@ -507,25 +580,18 @@ def main() -> None:
             else:
                 try:
                     with st.spinner("Comparing voice samples..."):
-                        verification_result = process_audio_bytes(
+                        verification_result = process_audio_bytes_multisegment(
                             verifier,
                             verification_bytes,
                             suffix=verification_suffix,
                         )
-                        similarity = score_embeddings(
+                    st.session_state["latest_verification_result"] = (
+                        build_multisegment_verification_result(
                             st.session_state["enrollment_embedding"],
-                            verification_result.embedding,
+                            verification_result,
+                            selected_label,
                         )
-                    # Each condition has its own validation-calibrated operating point.
-                    threshold = threshold_for_model(selected_label)
-                    same_speaker = decision_from_threshold(similarity, threshold)
-                    st.session_state["latest_verification_result"] = {
-                        "similarity": similarity,
-                        "threshold": threshold,
-                        "same_speaker": same_speaker,
-                        "model_label": selected_label,
-                        "metadata": verification_result.metadata,
-                    }
+                    )
                     st.rerun()
                 except Exception as exc:
                     show_processing_error("Verification", exc)
@@ -534,19 +600,20 @@ def main() -> None:
         render_section_heading(
             3,
             "Verification Result",
-            "The decision uses cosine similarity and the selected model's calibrated threshold.",
+            "Aggregated speaker similarity is shown without an operational decision.",
             eyebrow="Result",
         )
         render_result_card(
             latest_result["similarity"],
-            latest_result["threshold"],
-            latest_result["same_speaker"],
+            None,
+            None,
             latest_result.get("model_label", selected_label),
         )
         render_score_visualization(
             latest_result["similarity"],
-            latest_result["threshold"],
+            None,
         )
+        render_calibration_note()
         with st.expander("Verification sample details"):
             render_sample_details(latest_result["metadata"])
 

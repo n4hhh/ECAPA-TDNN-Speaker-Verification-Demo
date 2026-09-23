@@ -9,7 +9,13 @@ from typing import Optional, TypedDict, Union
 
 import torch
 
-from .audio import SpeechWindowMetadata, load_audio, load_audio_realtime
+from .audio import (
+    MultiSegmentMetadata,
+    SpeechWindowMetadata,
+    load_audio,
+    load_audio_multisegment,
+    load_audio_realtime,
+)
 from .model import EMBEDDING_DIM, DeviceLike, FrozenHandoffECAPAModel, load_model
 
 DEFAULT_CHECKPOINT_PATH = (
@@ -30,10 +36,57 @@ class RealtimeVerificationResult(VerificationResult):
     verification_metadata: SpeechWindowMetadata
 
 
+class MultiSegmentVerificationResult(VerificationResult):
+    enrollment_metadata: MultiSegmentMetadata
+    verification_metadata: MultiSegmentMetadata
+
+
 @dataclass(frozen=True)
 class RealtimeEmbedding:
     embedding: torch.Tensor
     metadata: SpeechWindowMetadata
+
+
+@dataclass(frozen=True)
+class MultiSegmentEmbedding:
+    embedding: torch.Tensor
+    metadata: MultiSegmentMetadata
+
+
+def aggregate_segment_embeddings(embeddings: torch.Tensor) -> torch.Tensor:
+    """Arithmetic-mean segment embeddings, then return one normalized CPU vector."""
+
+    if not isinstance(embeddings, torch.Tensor):
+        raise TypeError("embeddings must be a torch.Tensor.")
+    if embeddings.ndim != 2 or embeddings.shape[1] != EMBEDDING_DIM:
+        raise ValueError(
+            f"embeddings must have shape [N, {EMBEDDING_DIM}], "
+            f"but received {tuple(embeddings.shape)}."
+        )
+    if embeddings.shape[0] < 2:
+        raise ValueError("At least two segment embeddings are required for aggregation.")
+    values = embeddings.detach().to(device="cpu", dtype=torch.float32)
+    if not torch.isfinite(values).all():
+        raise ValueError("embeddings contain NaN or infinite values.")
+
+    mean_embedding = values.mean(dim=0)
+    mean_norm = torch.linalg.vector_norm(mean_embedding)
+    if (
+        not bool(torch.isfinite(mean_norm).item())
+        or float(mean_norm.item()) <= torch.finfo(torch.float32).eps
+    ):
+        raise RuntimeError("Segment embeddings produced a zero or non-finite mean.")
+    aggregated = (mean_embedding / mean_norm).to(torch.float32)
+    if aggregated.shape != (EMBEDDING_DIM,) or not torch.isfinite(aggregated).all():
+        raise RuntimeError("Aggregated embedding is invalid.")
+    if not torch.isclose(
+        torch.linalg.vector_norm(aggregated),
+        torch.tensor(1.0),
+        atol=1e-6,
+        rtol=0.0,
+    ):
+        raise RuntimeError("Aggregated embedding is not L2-normalized.")
+    return aggregated
 
 
 def _single_embedding(embedding: torch.Tensor, *, name: str) -> torch.Tensor:
@@ -120,6 +173,20 @@ class SpeakerVerifier:
             metadata=prepared.metadata,
         )
 
+    @torch.inference_mode()
+    def extract_embedding_multisegment(self, audio: PathLike) -> MultiSegmentEmbedding:
+        """Batch valid windows and aggregate them into one normalized embedding."""
+
+        prepared = load_audio_multisegment(audio)
+        # FrozenHandoffECAPAModel accepts [B, 48000], so all valid windows share one
+        # ECAPA call rather than being inferred independently in Python.
+        segment_embeddings = self.model.extract_embedding(prepared.windows)
+        aggregated = aggregate_segment_embeddings(segment_embeddings)
+        return MultiSegmentEmbedding(
+            embedding=aggregated,
+            metadata=prepared.metadata,
+        )
+
     def verify(
         self,
         enrollment_audio: PathLike,
@@ -152,6 +219,24 @@ class SpeakerVerifier:
             "similarity": similarity,
             "threshold": threshold_value,
             "same_speaker": decision_from_threshold(similarity, threshold_value),
+            "enrollment_metadata": enrollment.metadata,
+            "verification_metadata": verification.metadata,
+        }
+
+    def verify_multisegment(
+        self,
+        enrollment_audio: PathLike,
+        verification_audio: PathLike,
+    ) -> MultiSegmentVerificationResult:
+        """Score aggregated embeddings without applying single-window thresholds."""
+
+        enrollment = self.extract_embedding_multisegment(enrollment_audio)
+        verification = self.extract_embedding_multisegment(verification_audio)
+        similarity = score_embeddings(enrollment.embedding, verification.embedding)
+        return {
+            "similarity": similarity,
+            "threshold": None,
+            "same_speaker": None,
             "enrollment_metadata": enrollment.metadata,
             "verification_metadata": verification.metadata,
         }
