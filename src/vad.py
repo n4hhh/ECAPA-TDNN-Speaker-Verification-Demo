@@ -67,6 +67,8 @@ def detect_speech_activity(
         raise ValueError("WebRTC VAD mode must be between 0 and 3.")
 
     frame_samples = sample_rate * frame_duration_ms // 1_000
+    # WebRTC VAD accepts 16-bit PCM bytes rather than normalized float samples.
+    # Clipping protects the conversion from wraparound without altering model input.
     pcm = (
         waveform.detach()
         .to(device="cpu", dtype=torch.float32)
@@ -81,6 +83,8 @@ def detect_speech_activity(
 
     for start in range(0, pcm.numel(), frame_samples):
         frame = pcm[start : start + frame_samples]
+        # WebRTC requires a complete 10/20/30 ms frame. Padding affects only the
+        # analysis copy; SpeechActivity.num_samples keeps the true input boundary.
         if frame.numel() < frame_samples:
             frame = F.pad(frame, (0, frame_samples - frame.numel()))
         decisions.append(detector.is_speech(frame.numpy().tobytes(), sample_rate))
@@ -105,6 +109,8 @@ def speech_sample_mask(activity: SpeechActivity) -> torch.Tensor:
             "SpeechActivity frame count does not match its sample count and frame size."
         )
 
+    # Expand coarse frame decisions back to sample resolution for efficient sliding-
+    # window scoring. The final padded analysis frame is clipped to the real length.
     mask = torch.zeros(activity.num_samples, dtype=torch.bool)
     for index, is_speech in enumerate(activity.frame_is_speech):
         if is_speech:

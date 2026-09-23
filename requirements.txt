@@ -1,5 +1,6 @@
 torch==2.2.0
 torchaudio==2.2.0
+numpy==1.26.4
 speechbrain==1.0.3
 soundfile==0.12.1
 webrtcvad-wheels==2.0.14

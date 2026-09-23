@@ -16,6 +16,8 @@ TARGET_SAMPLE_RATE = 16_000
 SEGMENT_SECONDS = 3.0
 SEGMENT_SAMPLES = int(TARGET_SAMPLE_RATE * SEGMENT_SECONDS)
 
+# Realtime recordings must contain enough speech globally and inside the chosen
+# model window; this prevents a short voiced burst surrounded by silence from passing.
 MIN_TOTAL_SPEECH_SECONDS = 2.0
 MIN_SPEECH_IN_SELECTED_WINDOW_SECONDS = 1.5
 INSUFFICIENT_SPEECH_MESSAGE = (
@@ -43,6 +45,7 @@ class SpeechWindowMetadata:
     speech_in_selected_window_seconds: float
     total_speech_seconds: float
     sufficient_speech: bool
+    vad_used: bool = True
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,8 @@ def convert_to_mono_16k(waveform: torch.Tensor, sample_rate: int) -> torch.Tenso
         waveform = waveform.unsqueeze(0)
     waveform = waveform.to(dtype=torch.float32)
 
+    # Resampling operates channel-wise on [channels, time]. Mixing afterward avoids
+    # presenting a channel axis to the ECAPA feature extractor.
     if sample_rate != TARGET_SAMPLE_RATE:
         waveform = torchaudio.functional.resample(
             waveform,
@@ -129,6 +134,8 @@ def convert_to_mono_16k(waveform: torch.Tensor, sample_rate: int) -> torch.Tenso
 
 def _crop_or_right_pad_baseline(mono: torch.Tensor) -> torch.Tensor:
     num_samples = mono.shape[0]
+    # The frozen training/evaluation contract uses exactly 48,000 samples. Longer
+    # clips are center-cropped; shorter clips retain their timing and receive tail silence.
     if num_samples >= SEGMENT_SAMPLES:
         start = (num_samples - SEGMENT_SAMPLES) // 2
         mono = mono[start : start + SEGMENT_SAMPLES]
@@ -185,7 +192,12 @@ def select_speech_rich_window(
     speech_activity: Optional[SpeechActivity] = None,
     original_duration_seconds: Optional[float] = None,
 ) -> PreparedAudio:
-    """Select the contiguous three-second window with the most detected speech."""
+    """Select one contiguous three-second model waveform.
+
+    Exact 48,000-sample mono/16 kHz clips already match the frozen training and
+    final-test contract and are passed through directly. WebRTC VAD is only a
+    realtime UX adaptation for longer browser/upload recordings.
+    """
 
     _validate_sample_rate(sample_rate)
     _validate_waveform(waveform, context="speech-window waveform")
@@ -196,32 +208,68 @@ def select_speech_rich_window(
             f"Speech-window selection requires {TARGET_SAMPLE_RATE} Hz audio."
         )
 
+    if waveform.numel() == SEGMENT_SAMPLES:
+        # Frozen 3-second examples already satisfy the offline data contract. Running
+        # VAD here would make evaluation depend on an extra realtime-only component.
+        return PreparedAudio(
+            waveform=waveform.contiguous(),
+            metadata=SpeechWindowMetadata(
+                original_duration_seconds=(
+                    waveform.numel() / sample_rate
+                    if original_duration_seconds is None
+                    else original_duration_seconds
+                ),
+                selected_start_seconds=0.0,
+                selected_end_seconds=SEGMENT_SECONDS,
+                speech_in_selected_window_seconds=0.0,
+                total_speech_seconds=0.0,
+                sufficient_speech=True,
+                vad_used=False,
+            ),
+        )
+
     activity = speech_activity or detect_speech_activity(waveform, sample_rate)
     _validate_activity(activity, waveform.numel())
     activity_mask = speech_sample_mask(activity)
     total_speech_samples = int(activity_mask.sum().item())
 
-    if waveform.numel() > SEGMENT_SAMPLES:
-        cumulative = F.pad(activity_mask.to(torch.int64).cumsum(dim=0), (1, 0))
-        window_scores = cumulative[SEGMENT_SAMPLES:] - cumulative[:-SEGMENT_SAMPLES]
-        # torch.argmax returns the first maximum, providing the documented tie-break.
-        selected_start = int(torch.argmax(window_scores).item())
-        selected_stop = selected_start + SEGMENT_SAMPLES
-        selected_speech_samples = int(window_scores[selected_start].item())
-        selected_waveform = waveform[selected_start:selected_stop].contiguous()
-        selected_end_seconds = selected_stop / sample_rate
-    else:
+    # A clip shorter than the model window cannot be made valid by padding: the
+    # realtime path requires both real duration and detected speech to be sufficient.
+    if waveform.numel() < SEGMENT_SAMPLES:
         selected_start = 0
         selected_stop = waveform.numel()
         selected_speech_samples = total_speech_samples
-        selected_waveform = F.pad(
-            waveform,
-            (0, SEGMENT_SAMPLES - waveform.numel()),
-        ).contiguous()
         selected_end_seconds = selected_stop / sample_rate
+        metadata = SpeechWindowMetadata(
+            original_duration_seconds=(
+                waveform.numel() / sample_rate
+                if original_duration_seconds is None
+                else original_duration_seconds
+            ),
+            selected_start_seconds=0.0,
+            selected_end_seconds=selected_end_seconds,
+            speech_in_selected_window_seconds=selected_speech_samples / sample_rate,
+            total_speech_seconds=total_speech_samples / sample_rate,
+            sufficient_speech=False,
+            vad_used=True,
+        )
+        raise InsufficientSpeechError(metadata)
+
+    # Prefix sums score every contiguous 48,000-sample window in linear time. Each
+    # difference is the number of samples marked as speech in that candidate window.
+    cumulative = F.pad(activity_mask.to(torch.int64).cumsum(dim=0), (1, 0))
+    window_scores = cumulative[SEGMENT_SAMPLES:] - cumulative[:-SEGMENT_SAMPLES]
+    # torch.argmax returns the first maximum, providing the documented tie-break.
+    selected_start = int(torch.argmax(window_scores).item())
+    selected_stop = selected_start + SEGMENT_SAMPLES
+    selected_speech_samples = int(window_scores[selected_start].item())
+    selected_waveform = waveform[selected_start:selected_stop].contiguous()
+    selected_end_seconds = selected_stop / sample_rate
 
     total_speech_seconds = total_speech_samples / sample_rate
     selected_speech_seconds = selected_speech_samples / sample_rate
+    # Enforce both recording-level and selected-window quality so a locally dense
+    # window cannot hide that the overall utterance contains too little speech.
     sufficient = (
         total_speech_seconds >= MIN_TOTAL_SPEECH_SECONDS
         and selected_speech_seconds >= MIN_SPEECH_IN_SELECTED_WINDOW_SECONDS
@@ -237,6 +285,7 @@ def select_speech_rich_window(
         speech_in_selected_window_seconds=selected_speech_seconds,
         total_speech_seconds=total_speech_seconds,
         sufficient_speech=sufficient,
+        vad_used=True,
     )
     if not sufficient:
         raise InsufficientSpeechError(metadata)

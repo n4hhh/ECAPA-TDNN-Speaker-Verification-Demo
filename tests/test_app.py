@@ -115,6 +115,20 @@ class AppHelperTests(unittest.TestCase):
             found = app.discover_checkpoint_files(root)
         self.assertEqual([path.name for path in found], ["a.pt", "b.PTH"])
 
+    def test_thesis_model_labels_and_ordering(self) -> None:
+        paths = [
+            Path("checkpoints/best_random.pt").resolve(),
+            Path("checkpoints/extra.pt").resolve(),
+            Path("checkpoints/best_adp.pt").resolve(),
+            Path("checkpoints/best_raw.pt").resolve(),
+        ]
+        ordered = app._ordered_model_options(paths)
+        self.assertEqual(
+            [app._checkpoint_label(path) for path in ordered[:3]],
+            ["RAW", "RANDOM", "ADAPTIVE"],
+        )
+        self.assertEqual(app._model_label(ordered[2]), "ADAPTIVE")
+
     def test_microphone_and_upload_bytes_share_one_realtime_method(self) -> None:
         verifier = Mock()
         seen_suffixes: list[str] = []

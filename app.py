@@ -19,9 +19,9 @@ from src.audio import (
     SpeechWindowMetadata,
 )
 from src.inference import (
-    PROVISIONAL_ADP_AUG_CROSS_DOMAIN_EER_THRESHOLD,
     RealtimeEmbedding,
     SpeakerVerifier,
+    decision_from_threshold,
     score_embeddings,
 )
 from src.model import (
@@ -29,11 +29,17 @@ from src.model import (
     load_checkpoint,
     validate_checkpoint,
 )
+from src.model_thresholds import threshold_for_model
 
 LOGGER = logging.getLogger("speaker_verification_demo")
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHECKPOINT_DIRECTORY = PROJECT_ROOT / "checkpoints"
 CHECKPOINT_SUFFIXES = {".pt", ".pth"}
+PRIMARY_MODEL_FILES = {
+    "RAW": "best_raw.pt",
+    "RANDOM": "best_random.pt",
+    "ADAPTIVE": "best_adp.pt",
+}
 SUPPORTED_UPLOAD_SUFFIXES = {".wav", ".mp3"}
 MP3_DECODE_ERROR_MESSAGE = (
     "Unable to decode this MP3 file. Please try another file or upload WAV audio."
@@ -71,6 +77,8 @@ def clear_enrollment_state(
 ) -> None:
     """Remove all model-dependent enrollment and verification state."""
 
+    # An enrollment embedding is meaningful only for the checkpoint that produced it;
+    # clear every derived value together to prevent cross-model verification.
     state["enrollment_embedding"] = None
     state["enrollment_model_path"] = None
     state["enrollment_metadata"] = None
@@ -79,6 +87,8 @@ def clear_enrollment_state(
     state["enrollment_saved"] = False
     state["latest_verification_result"] = None
     if reset_inputs:
+        # Streamlit widget keys are immutable during a run. Advancing the version gives
+        # the recorder and uploader fresh keys on the next rerun, which clears their UI.
         state["enrollment_input_version"] = state.get("enrollment_input_version", 0) + 1
         state["verification_input_version"] = state.get("verification_input_version", 0) + 1
 
@@ -170,6 +180,8 @@ def inspect_checkpoint_candidate(
 def discover_compatible_checkpoints(
     directory: Path,
 ) -> tuple[list[Path], list[tuple[Path, str]]]:
+    # Validate every candidate up front so the model selector never offers a file that
+    # is known to violate the frozen checkpoint contract.
     compatible: list[Path] = []
     rejected: list[tuple[Path, str]] = []
     for path in discover_checkpoint_files(directory):
@@ -218,6 +230,8 @@ def process_audio_bytes(
     if normalized_suffix == ".mp3" and not mp3_decoder_available():
         raise Mp3DecodeError(MP3_DECODE_ERROR_MESSAGE)
 
+    # The core audio pipeline is file-based. A private temporary directory bridges
+    # Streamlit's in-memory upload without leaving recordings on disk after inference.
     with tempfile.TemporaryDirectory(prefix="speaker_verification_ui_") as temp_name:
         audio_path = Path(temp_name) / f"input{normalized_suffix}"
         audio_path.write_bytes(audio_bytes)
@@ -231,15 +245,17 @@ def process_audio_bytes(
 
 def render_metadata(metadata: SpeechWindowMetadata) -> None:
     st.write(f"Original duration: {metadata.original_duration_seconds:.2f} s")
-    st.write(f"Detected speech: {metadata.total_speech_seconds:.2f} s")
+    if metadata.vad_used:
+        st.write(f"Detected speech: {metadata.total_speech_seconds:.2f} s")
     st.write(
         "Selected segment: "
         f"{metadata.selected_start_seconds:.2f} - {metadata.selected_end_seconds:.2f} s"
     )
-    st.write(
-        "Speech in segment: "
-        f"{metadata.speech_in_selected_window_seconds:.2f} s"
-    )
+    if metadata.vad_used:
+        st.write(
+            "Speech in segment: "
+            f"{metadata.speech_in_selected_window_seconds:.2f} s"
+        )
 
 
 def render_audio_input(
@@ -299,25 +315,40 @@ def show_processing_error(context: str, exc: Exception) -> None:
 
 def _checkpoint_label(path_string: str) -> str:
     path = Path(path_string)
+    for label, filename in PRIMARY_MODEL_FILES.items():
+        if path.name.lower() == filename.lower():
+            return label
     try:
         return str(path.relative_to(CHECKPOINT_DIRECTORY.resolve()))
     except ValueError:
         return path.name
 
 
+def _model_label(path_string: str) -> str:
+    return _checkpoint_label(path_string).upper()
+
+
+def _ordered_model_options(paths: list[Path]) -> list[str]:
+    # Keep thesis conditions in a stable, recognizable order; append any additional
+    # compatible checkpoints without hiding them from the user.
+    by_name = {path.name.lower(): str(path) for path in paths}
+    ordered: list[str] = []
+    for filename in PRIMARY_MODEL_FILES.values():
+        value = by_name.get(filename.lower())
+        if value is not None:
+            ordered.append(value)
+    return ordered + [str(path) for path in paths if str(path) not in ordered]
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Vietnamese Speaker Verification Demo",
-        page_icon="🎙️",
         layout="centered",
     )
     initialize_session_state(st.session_state)
 
     st.title("Vietnamese Speaker Verification Demo")
-    st.caption(
-        "Enrollment and verification may contain different spoken content. "
-        "Speak naturally for several seconds."
-    )
+    st.caption("Text-independent ECAPA-TDNN speaker verification")
 
     compatible, rejected = discover_compatible_checkpoints(CHECKPOINT_DIRECTORY)
     if rejected:
@@ -328,9 +359,24 @@ def main() -> None:
         st.error("No compatible .pt or .pth checkpoints were found in checkpoints/.")
         st.stop()
 
-    model_options = [str(path) for path in compatible]
+    model_options = _ordered_model_options(compatible)
     active_path = st.session_state.get("active_model_path")
-    selected_index = model_options.index(active_path) if active_path in model_options else 0
+    adaptive_path = next(
+        (
+            option
+            for option in model_options
+            if Path(option).name.lower() == PRIMARY_MODEL_FILES["ADAPTIVE"]
+        ),
+        None,
+    )
+    # Preserve the current choice across Streamlit reruns. On first launch, prefer the
+    # adaptive-noise checkpoint because it is the demo's primary operating condition.
+    if active_path in model_options:
+        selected_index = model_options.index(active_path)
+    elif adaptive_path is not None:
+        selected_index = model_options.index(adaptive_path)
+    else:
+        selected_index = 0
     selected_model = st.selectbox(
         "Model",
         model_options,
@@ -338,6 +384,8 @@ def main() -> None:
         format_func=_checkpoint_label,
         key="model_selector",
     )
+    selected_label = _model_label(selected_model)
+    st.caption("ECAPA-TDNN · 192-D embedding · Cosine similarity")
     enrollment_invalidated = activate_model(st.session_state, selected_model)
     if enrollment_invalidated:
         st.info("Model changed. Please save a new enrollment utterance.")
@@ -420,11 +468,15 @@ def main() -> None:
                         st.session_state["enrollment_embedding"],
                         verification_result.embedding,
                     )
-                threshold = PROVISIONAL_ADP_AUG_CROSS_DOMAIN_EER_THRESHOLD
+                # Thresholds are calibrated separately for each training condition;
+                # using a different model's operating point would invalidate the decision.
+                threshold = threshold_for_model(selected_label)
+                same_speaker = decision_from_threshold(similarity, threshold)
                 st.session_state["latest_verification_result"] = {
                     "similarity": similarity,
                     "threshold": threshold,
-                    "same_speaker": similarity >= threshold,
+                    "same_speaker": same_speaker,
+                    "model_label": selected_label,
                     "metadata": verification_result.metadata,
                 }
             except Exception as exc:
@@ -433,12 +485,20 @@ def main() -> None:
     latest_result = st.session_state.get("latest_verification_result")
     if latest_result is not None and ready_to_verify:
         st.subheader("Verification Result")
+        st.write(f"Model: {latest_result.get('model_label', selected_label)}")
         st.write(f"Similarity Score: `{latest_result['similarity']:.4f}`")
-        st.write(f"Decision Threshold: `{latest_result['threshold']:.4f}`")
-        if latest_result["same_speaker"]:
-            st.success("SAME SPEAKER")
+        if latest_result["threshold"] is None:
+            st.write("Operational Threshold: Not configured")
+            st.write("Decision: Not available")
+            st.info(
+                "Unavailable until a validation-calibrated threshold is configured."
+            )
         else:
-            st.error("DIFFERENT SPEAKER")
+            st.write(f"Decision Threshold: `{latest_result['threshold']:.4f}`")
+            if latest_result["same_speaker"]:
+                st.success("SAME SPEAKER")
+            else:
+                st.error("DIFFERENT SPEAKER")
         render_metadata(latest_result["metadata"])
 
     st.divider()
@@ -452,15 +512,22 @@ def main() -> None:
 
     with st.expander("Technical Information"):
         st.write("Model: ECAPA-TDNN")
+        st.write("Base: speechbrain/spkrec-ecapa-voxceleb")
+        st.write(f"Selected condition: {selected_label}")
         st.write("Embedding dimension: 192")
-        st.write("Input: 16 kHz mono")
-        st.write("Model segment: 3.0 seconds / 48,000 samples")
-        st.write("Preprocessing: WebRTC VAD + speech-rich window selection")
+        st.write("Input: mono 16 kHz")
+        st.write("Segment: 3.0 s / 48,000 samples")
+        st.write("Features: SpeechBrain FBank, 80 mel bins")
+        st.write("Realtime selection: WebRTC VAD speech-rich contiguous window")
         st.write("Scoring: Cosine similarity")
+        configured_threshold = threshold_for_model(selected_label)
         st.write(
-            "Current threshold: "
-            f"{PROVISIONAL_ADP_AUG_CROSS_DOMAIN_EER_THRESHOLD:.4f} "
-            "(provisional operating point)"
+            "Threshold: "
+            + (
+                "not calibrated/configured"
+                if configured_threshold is None
+                else f"{configured_threshold:.4f}"
+            )
         )
         st.write(
             "The spoken content of enrollment and verification utterances "

@@ -46,7 +46,22 @@ class VerifyPairCliTests(unittest.TestCase):
         self.assertIn("Enrollment:", rendered)
         self.assertIn("Verification:", rendered)
         self.assertIn("cosine similarity: 1.000000", rendered)
-        self.assertIn("threshold: 0.100700", rendered)
+        self.assertIn("operational threshold: not configured", rendered)
+        self.assertIn("decision: unavailable", rendered)
+
+    @patch("scripts.verify_pair.SpeakerVerifier")
+    def test_manual_threshold_output(self, verifier_class) -> None:
+        verifier_class.return_value.extract_embedding_realtime.side_effect = [
+            RealtimeEmbedding(unit_embedding(), metadata()),
+            RealtimeEmbedding(unit_embedding(), metadata()),
+        ]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exit_code = main(["enrollment.wav", "verification.wav", "--threshold", "0.5"])
+
+        self.assertEqual(exit_code, 0)
+        rendered = output.getvalue()
+        self.assertIn("manual/development threshold: 0.500000", rendered)
         self.assertIn("SAME SPEAKER", rendered)
 
     @patch("scripts.verify_pair.SpeakerVerifier")

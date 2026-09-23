@@ -80,39 +80,44 @@ class RealtimeAudioTests(unittest.TestCase):
             torch.equal(prepared.waveform, waveform[start : start + SEGMENT_SAMPLES])
         )
 
-    def test_short_recording_validates_then_right_pads(self) -> None:
+    def test_exact_three_second_recording_uses_model_preprocessing_only(self) -> None:
+        waveform = make_waveform(3.0)
+        prepared = select_speech_rich_window(waveform)
+        self.assertEqual(prepared.waveform.shape, (SEGMENT_SAMPLES,))
+        self.assertTrue(torch.equal(prepared.waveform, waveform))
+        self.assertFalse(prepared.metadata.vad_used)
+        self.assertTrue(prepared.metadata.sufficient_speech)
+
+    def test_short_recording_is_rejected_instead_of_padded(self) -> None:
         waveform = make_waveform(2.5)
         activity = make_activity(waveform.numel(), [(0.0, 2.5)])
-        prepared = select_speech_rich_window(waveform, speech_activity=activity)
-        self.assertEqual(prepared.waveform.shape, (SEGMENT_SAMPLES,))
-        self.assertTrue(torch.equal(prepared.waveform[: waveform.numel()], waveform))
-        self.assertEqual(torch.count_nonzero(prepared.waveform[waveform.numel() :]), 0)
-        self.assertAlmostEqual(prepared.metadata.selected_end_seconds, 2.5)
+        with self.assertRaises(InsufficientSpeechError) as caught:
+            select_speech_rich_window(waveform, speech_activity=activity)
+        self.assertFalse(caught.exception.metadata.sufficient_speech)
+        self.assertTrue(caught.exception.metadata.vad_used)
 
     def test_stereo_conversion_precedes_activity_selection(self) -> None:
         mono = make_waveform(3.0)
         stereo = torch.stack((mono, mono * 0.5))
         converted = convert_to_mono_16k(stereo, TARGET_SAMPLE_RATE)
-        activity = make_activity(converted.numel(), [(0.0, 3.0)])
         prepared = prepare_audio_realtime(
             stereo,
             TARGET_SAMPLE_RATE,
-            speech_activity=activity,
         )
         self.assertEqual(prepared.waveform.shape, (SEGMENT_SAMPLES,))
+        self.assertFalse(prepared.metadata.vad_used)
         self.assertTrue(torch.isfinite(prepared.waveform).all())
 
     def test_non_16khz_input_is_resampled_before_selection(self) -> None:
         source_rate = 44_100
         waveform = torch.linspace(-0.2, 0.2, source_rate * 3, dtype=torch.float32)
         converted = convert_to_mono_16k(waveform, source_rate)
-        activity = make_activity(converted.numel(), [(0.0, 3.0)])
         prepared = prepare_audio_realtime(
             waveform,
             source_rate,
-            speech_activity=activity,
         )
         self.assertEqual(prepared.waveform.shape, (SEGMENT_SAMPLES,))
+        self.assertFalse(prepared.metadata.vad_used)
         self.assertAlmostEqual(prepared.metadata.original_duration_seconds, 3.0)
 
     def test_silence_is_rejected_by_real_vad(self) -> None:

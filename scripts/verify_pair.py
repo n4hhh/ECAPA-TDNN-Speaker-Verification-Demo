@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -15,8 +14,8 @@ from src.audio import (
     SpeechWindowMetadata,
 )
 from src.inference import (
-    PROVISIONAL_ADP_AUG_CROSS_DOMAIN_EER_THRESHOLD,
     SpeakerVerifier,
+    decision_from_threshold,
     score_embeddings,
 )
 
@@ -28,11 +27,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=PROVISIONAL_ADP_AUG_CROSS_DOMAIN_EER_THRESHOLD,
+        default=None,
         help=(
-            "Cosine-similarity decision threshold "
-            f"(default: provisional {PROVISIONAL_ADP_AUG_CROSS_DOMAIN_EER_THRESHOLD})."
+            "Manual/development cosine-similarity threshold. If omitted, no "
+            "same/different decision is produced."
         ),
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Checkpoint path (default: checkpoints/best_adp.pt).",
     )
     return parser.parse_args(argv)
 
@@ -53,11 +58,8 @@ def _print_metadata(label: str, metadata: SpeechWindowMetadata) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    if not math.isfinite(args.threshold):
-        print("Error: threshold must be finite.", file=sys.stderr)
-        return 2
 
-    verifier = SpeakerVerifier()
+    verifier = SpeakerVerifier() if args.checkpoint is None else SpeakerVerifier(args.checkpoint)
     try:
         enrollment = verifier.extract_embedding_realtime(args.enrollment)
     except InsufficientSpeechError as exc:
@@ -81,15 +83,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     similarity = score_embeddings(enrollment.embedding, verification.embedding)
-    same_speaker = similarity >= args.threshold
+    same_speaker = decision_from_threshold(similarity, args.threshold)
     _print_metadata("Enrollment", enrollment.metadata)
     print()
     _print_metadata("Verification", verification.metadata)
     print()
     print("Result:")
     print(f"  cosine similarity: {similarity:.6f}")
-    print(f"  threshold: {args.threshold:.6f}")
-    print(f"  {'SAME SPEAKER' if same_speaker else 'DIFFERENT SPEAKER'}")
+    if args.threshold is None:
+        print("  operational threshold: not configured")
+        print("  decision: unavailable until a validation-calibrated threshold is configured")
+    else:
+        print(f"  manual/development threshold: {args.threshold:.6f}")
+        print(f"  {'SAME SPEAKER' if same_speaker else 'DIFFERENT SPEAKER'}")
     return 0
 
 
