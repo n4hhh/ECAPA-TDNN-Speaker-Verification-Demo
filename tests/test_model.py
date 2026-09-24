@@ -18,7 +18,9 @@ from src.model import (
 )
 from src.model_thresholds import (
     MODEL_THRESHOLDS,
+    MULTISEGMENT_MODEL_THRESHOLDS,
     SINGLE_WINDOW_MODEL_THRESHOLDS,
+    multisegment_threshold_for_model,
     single_window_threshold_for_model,
     threshold_for_model,
 )
@@ -94,6 +96,23 @@ class CheckpointValidationTests(unittest.TestCase):
             MODEL_THRESHOLDS["ADAPTIVE"],
         )
 
+    def test_multisegment_thresholds_match_reviewed_report(self) -> None:
+        self.assertEqual(
+            MULTISEGMENT_MODEL_THRESHOLDS,
+            {
+                "RAW": 0.20708201825618744,
+                "RANDOM": 0.2140672206878662,
+                "ADAPTIVE": 0.21084168553352356,
+            },
+        )
+        for label, value in MULTISEGMENT_MODEL_THRESHOLDS.items():
+            self.assertEqual(multisegment_threshold_for_model(label.lower()), value)
+            self.assertEqual(multisegment_threshold_for_model(label), value)
+            self.assertNotEqual(single_window_threshold_for_model(label), value)
+            self.assertEqual(threshold_for_model(label), SINGLE_WINDOW_MODEL_THRESHOLDS[label])
+        self.assertIsNone(multisegment_threshold_for_model("UNKNOWN"))
+        self.assertIsNone(single_window_threshold_for_model("UNKNOWN"))
+
     def test_new_checkpoint_schema_is_accepted(self) -> None:
         metadata = validate_checkpoint(checkpoint())
         self.assertEqual(metadata.schema, CHECKPOINT_SCHEMA)
@@ -138,6 +157,8 @@ class CheckpointValidationTests(unittest.TestCase):
     def test_threshold_none_does_not_make_decision(self) -> None:
         self.assertIsNone(decision_from_threshold(0.9, None))
         self.assertTrue(decision_from_threshold(0.9, 0.5))
+        self.assertTrue(decision_from_threshold(0.5, 0.5))
+        self.assertFalse(decision_from_threshold(0.499, 0.5))
 
     def test_cosine_scoring(self) -> None:
         left = torch.zeros(EMBEDDING_DIM)

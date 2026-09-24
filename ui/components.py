@@ -26,7 +26,7 @@ def render_header() -> None:
         <header class="voice-hero">
           <div class="voice-kicker"><span class="voice-mark"></span>VOICE ID</div>
           <h1>Vietnamese Speaker Verification</h1>
-          <p>ECAPA-TDNN based voice authentication demonstration</p>
+          <p>ECAPA-TDNN based speaker verification demonstration</p>
           <div class="voice-context">Final-year thesis demonstration · Text-independent verification</div>
         </header>
         """
@@ -209,23 +209,23 @@ def render_result_card(
     if same_speaker is True:
         style = "match"
         icon = "✓"
-        title = "Identity Match"
-        detail = "The verification sample matched the enrolled speaker."
+        title = "Same Speaker"
+        detail = "The aggregated cosine similarity meets the multi-segment operating threshold."
         decision = "SAME SPEAKER"
     elif same_speaker is False:
         style = "no-match"
         icon = "×"
-        title = "Identity Not Matched"
-        detail = "The verification sample did not match the enrolled speaker."
+        title = "Different Speaker"
+        detail = "The aggregated cosine similarity is below the multi-segment operating threshold."
         decision = "DIFFERENT SPEAKER"
     else:
         style = "unavailable"
         icon = "—"
         title = "Speaker Similarity"
-        detail = "Multi-segment threshold calibration is pending."
-        decision = "NOT AVAILABLE"
+        detail = "No multi-segment operating threshold is configured for this model."
+        decision = "DECISION UNAVAILABLE"
 
-    threshold_text = "Not calibrated" if threshold is None else f"{threshold:.4f}"
+    threshold_text = "Not configured" if threshold is None else f"{threshold:.4f}"
     st.html(
         f"""
         <section class="result-card result-{style}">
@@ -238,9 +238,9 @@ def render_result_card(
             </div>
           </div>
           <div class="result-metrics">
-            <div><span>Similarity score</span><strong>{similarity:.4f}</strong></div>
-            <div><span>Decision threshold</span><strong>{threshold_text}</strong></div>
-            <div><span>Model</span><strong>{html.escape(model_label)}</strong></div>
+            <div><span>Cosine similarity</span><strong>{similarity:.4f}</strong></div>
+            <div><span>Operational threshold</span><strong>{threshold_text}</strong></div>
+            <div><span>Selected model</span><strong>{html.escape(model_label)}</strong></div>
           </div>
         </section>
         """
@@ -274,8 +274,8 @@ def render_calibration_note() -> None:
     st.html(
         """
         <div class="calibration-note">
-          The current calibrated operating points belong to the historical
-          single-window protocol and are not reused for multi-segment inference.
+          This multi-segment operating threshold was calibrated on a separate
+          9-speaker / 27-recording demo set, outside the frozen thesis evaluation.
         </div>
         """
     )

@@ -11,6 +11,7 @@ import torch
 
 from .audio import (
     MultiSegmentMetadata,
+    PreparedMultiSegmentAudio,
     SpeechWindowMetadata,
     load_audio,
     load_audio_multisegment,
@@ -51,6 +52,18 @@ class RealtimeEmbedding:
 class MultiSegmentEmbedding:
     embedding: torch.Tensor
     metadata: MultiSegmentMetadata
+
+
+@torch.inference_mode()
+def embedding_from_prepared_multisegment(
+    model: FrozenHandoffECAPAModel,
+    prepared: PreparedMultiSegmentAudio,
+) -> MultiSegmentEmbedding:
+    """Apply the deployed batched model and aggregation to prepared windows."""
+
+    segment_embeddings = model.extract_embedding(prepared.windows)
+    aggregated = aggregate_segment_embeddings(segment_embeddings)
+    return MultiSegmentEmbedding(embedding=aggregated, metadata=prepared.metadata)
 
 
 def aggregate_segment_embeddings(embeddings: torch.Tensor) -> torch.Tensor:
@@ -178,14 +191,7 @@ class SpeakerVerifier:
         """Batch valid windows and aggregate them into one normalized embedding."""
 
         prepared = load_audio_multisegment(audio)
-        # FrozenHandoffECAPAModel accepts [B, 48000], so all valid windows share one
-        # ECAPA call rather than being inferred independently in Python.
-        segment_embeddings = self.model.extract_embedding(prepared.windows)
-        aggregated = aggregate_segment_embeddings(segment_embeddings)
-        return MultiSegmentEmbedding(
-            embedding=aggregated,
-            metadata=prepared.metadata,
-        )
+        return embedding_from_prepared_multisegment(self.model, prepared)
 
     def verify(
         self,

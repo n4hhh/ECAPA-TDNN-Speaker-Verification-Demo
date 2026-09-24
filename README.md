@@ -21,11 +21,8 @@ Enrollment -> Verification -> Result
    default when its checkpoint is available.
 2. Create a session-only voice profile from the microphone or a WAV/MP3 upload.
 3. Record or upload a second, text-independent verification sample.
-4. Review the aggregated cosine similarity, selected model, and real
-   multi-segment preprocessing timings reported by the backend.
-
-The current multi-segment Streamlit protocol does not issue a SAME/DIFFERENT
-decision because a matching operational threshold has not yet been calibrated.
+4. Review the aggregated cosine similarity, model-specific multi-segment
+   operating threshold, SAME/DIFFERENT SPEAKER decision, and preprocessing timings.
 
 Changing the model clears the model-specific enrollment. **Verify again** clears
 only the latest verification result and input, while **Clear enrollment** removes
@@ -140,8 +137,10 @@ Cosine similarity is not a probability or confidence percentage.
 
 ## Thresholds And Decisions
 
-`src/model_thresholds.py` contains validation-calibrated empirical EER operating
-points for the historical single-window protocol:
+### Historical single-window operating points
+
+`src/model_thresholds.py` retains these validation-calibrated empirical EER
+operating points for the historical single-window protocol:
 
 | Model | Decision threshold |
 | --- | ---: |
@@ -149,13 +148,72 @@ points for the historical single-window protocol:
 | RANDOM | `0.16918502748012543` |
 | ADAPTIVE | `0.172615185379982` |
 
-Historical callers apply the selected model's threshold without modification
-using `similarity >= threshold`. Threshold selection did not use final-test data.
+Historical callers apply the selected model's threshold using
+`similarity >= threshold`. These values do not apply to aggregated recordings.
 
-**No multi-segment operational threshold has yet been calibrated.** The
-Streamlit app does not reuse the values above, invent a replacement, or produce
-a SAME/DIFFERENT decision. It displays the aggregated cosine similarity and
-reports **Threshold: Not calibrated** and **Decision: Unavailable**.
+### Multi-segment operational demo thresholds
+
+| Model | Decision threshold |
+| --- | ---: |
+| RAW | `0.20708201825618744` |
+| RANDOM | `0.2140672206878662` |
+| ADAPTIVE | `0.21084168553352356` |
+
+The Streamlit demo compares aggregated enrollment and verification embeddings
+using the selected model's multi-segment threshold. Equality means **SAME
+SPEAKER**; a lower similarity means **DIFFERENT SPEAKER**. An unconfigured model
+still shows its similarity with the decision unavailable. Cosine similarity is
+not a probability.
+
+These operating points were calibrated on a separate set of 9 speakers with
+3 independent recordings each (27 recordings). Each source supplied one
+deterministic 10-second center crop after mono 16 kHz conversion. The frozen
+trial list contains 27 genuine and 324 impostor pairs, 351 total. The operating
+point is the nearest empirical FAR/FRR gap, with EER `(FAR + FRR) / 2` and no
+interpolation. No final-test data was used. The three reported calibration EERs
+were each `0.14814814814814814`; this small demo set and its 27 genuine trials
+do not establish equal or comparative thesis model performance.
+
+## Multi-Segment Demo Calibration
+
+The local `audio_val/` set is intended only for operational calibration of the
+multi-segment demo. It is not training or final-test data, and its small size
+does not establish comparative performance among RAW, RANDOM, and ADAPTIVE.
+The script requires nine lowercase speaker folders with three correctly named
+WAV recordings each. The parent folder supplies the speaker label.
+
+```text
+raw recording
+-> deterministic 10.0-second center crop after mono 16 kHz conversion
+-> production multi-segment window selection and batched ECAPA inference
+-> one aggregated embedding per original recording
+-> one frozen list of all genuine and impostor pairs
+-> cosine scores
+-> nearest empirical FAR/FRR operating point
+```
+
+Raw sources may exceed the demo's 20-second input limit because cropping occurs
+first; the 20-second deployment limit is unchanged. Each source contributes
+exactly one crop, so 27 files remain 27 independent recording samples. The
+script writes dataset and crop provenance before inference and exits nonzero if
+any file fails naming, decoding, duration, or multi-segment speech validation.
+It never calibrates on a reduced subset.
+
+Run the audit or full pipeline from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\calibrate_multisegment_thresholds.py --audit-only
+.\.venv\Scripts\python.exe scripts\calibrate_multisegment_thresholds.py
+```
+
+Outputs go to `reports/multisegment_calibration/`. The empirical EER method
+examines all distinct observed scores as thresholds, uses acceptance when
+`similarity >= threshold`, and selects the first (highest) threshold minimizing
+`abs(FAR - FRR)`. It reports `(FAR + FRR) / 2` at that attainable operating
+point, matching the thesis notebook's nearest empirical point convention; no
+interpolation or hand selection is used. The reviewed report values are
+explicit constants in `src/model_thresholds.py`; the app does not read report
+files at runtime. The reports remain audit provenance.
 
 ## Setup
 
@@ -232,7 +290,7 @@ src/audio.py        decoding and distinct single-/multi-segment preprocessing
 src/model.py        checkpoint validation and strict ECAPA construction
 src/inference.py    batched extraction, mean aggregation, and cosine scoring
 src/vad.py          WebRTC speech activity detection
-src/model_thresholds.py  historical single-window threshold mapping
+src/model_thresholds.py  separate historical and multi-segment threshold mappings
 scripts/           diagnostics and CLI verification
 tests/             unit tests that avoid requiring huge real checkpoints
 ```

@@ -1,0 +1,38 @@
+{
+  "expected_speakers": 9,
+  "observed_speakers": 9,
+  "expected_recordings_per_speaker": 3,
+  "expected_total_recordings": 27,
+  "observed_total_recordings": 27,
+  "speaker_ids": [
+    "bomman",
+    "domixi",
+    "huanhoahong",
+    "jv",
+    "khabanh",
+    "ntn",
+    "pewpew",
+    "sena",
+    "truongcon"
+  ],
+  "recording_counts_by_speaker": {
+    "bomman": 3,
+    "domixi": 3,
+    "huanhoahong": 3,
+    "jv": 3,
+    "khabanh": 3,
+    "ntn": 3,
+    "pewpew": 3,
+    "sena": 3,
+    "truongcon": 3
+  },
+  "duration_min": 20.07090702947846,
+  "duration_max": 34.89659863945578,
+  "duration_mean": 24.89998824221047,
+  "all_naming_checks_passed": true,
+  "all_decode_checks_passed": true,
+  "all_multisegment_checks_passed": true,
+  "calibration_ready": true,
+  "global_failures": [],
+  "recording_failures": []
+}

@@ -8,6 +8,7 @@ from streamlit.testing.v1 import AppTest
 
 from src.audio import MultiSegmentMetadata, ValidSegmentMetadata
 from src.model import EMBEDDING_DIM
+from src.model_thresholds import MULTISEGMENT_MODEL_THRESHOLDS
 
 
 def embedding() -> torch.Tensor:
@@ -34,6 +35,44 @@ def metadata() -> MultiSegmentMetadata:
 
 
 class StreamlitRenderTests(unittest.TestCase):
+    def test_each_model_renders_its_multisegment_operating_point(self) -> None:
+        filenames = {
+            "RAW": "best_raw.pt",
+            "RANDOM": "best_random.pt",
+            "ADAPTIVE": "best_adp.pt",
+        }
+        for label, filename in filenames.items():
+            with self.subTest(label=label):
+                checkpoint = str(Path("checkpoints", filename).resolve())
+                threshold = MULTISEGMENT_MODEL_THRESHOLDS[label]
+                app = AppTest.from_file("app.py", default_timeout=60)
+                for key, value in {
+                    "active_model_path": checkpoint,
+                    "enrollment_embedding": embedding(),
+                    "enrollment_model_path": checkpoint,
+                    "enrollment_metadata": metadata(),
+                    "enrollment_saved": True,
+                    "latest_verification_result": {
+                        "similarity": threshold,
+                        "threshold": threshold,
+                        "same_speaker": True,
+                        "model_label": label,
+                        "metadata": metadata(),
+                    },
+                }.items():
+                    app.session_state[key] = value
+                app.run()
+                self.assertEqual(len(app.exception), 0)
+                self.assertEqual(app.selectbox[0].value, checkpoint)
+                self.assertIn(
+                    f"Multi-segment operating threshold:** {threshold:.4f}",
+                    app.markdown[0].value,
+                )
+                rendered = "".join(element.proto.body for element in app.get("html"))
+                self.assertIn("SAME SPEAKER", rendered)
+                self.assertIn(f"Operational threshold</span><strong>{threshold:.4f}", rendered)
+                self.assertIn('class="threshold-line"', rendered)
+
     def test_initial_render_loads_model_and_guards_verification(self) -> None:
         app = AppTest.from_file("app.py", default_timeout=60).run()
         self.assertEqual(len(app.exception), 0)
@@ -48,7 +87,7 @@ class StreamlitRenderTests(unittest.TestCase):
         self.assertFalse(buttons["CREATE VOICE PROFILE"].disabled)
         self.assertTrue(buttons["VERIFY SPEAKER"].disabled)
 
-    def test_aggregated_enrollment_and_neutral_result_render(self) -> None:
+    def test_aggregated_enrollment_and_calibrated_result_render(self) -> None:
         checkpoint = str(Path("checkpoints/best_adp.pt").resolve())
         app = AppTest.from_file("app.py", default_timeout=60)
         initial_state = {
@@ -61,8 +100,8 @@ class StreamlitRenderTests(unittest.TestCase):
             "enrollment_saved": True,
             "latest_verification_result": {
                 "similarity": 0.4281,
-                "threshold": None,
-                "same_speaker": None,
+                "threshold": MULTISEGMENT_MODEL_THRESHOLDS["ADAPTIVE"],
+                "same_speaker": True,
                 "model_label": "ADAPTIVE",
                 "metadata": metadata(),
             },
@@ -81,6 +120,10 @@ class StreamlitRenderTests(unittest.TestCase):
         expander_labels = {expander.label for expander in app.expander}
         self.assertIn("Enrollment segment details", expander_labels)
         self.assertIn("Verification sample details", expander_labels)
+        self.assertEqual(
+            app.session_state["latest_verification_result"]["threshold"],
+            MULTISEGMENT_MODEL_THRESHOLDS["ADAPTIVE"],
+        )
 
 
 if __name__ == "__main__":

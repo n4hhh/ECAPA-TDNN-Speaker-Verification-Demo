@@ -19,7 +19,13 @@ from src.audio import (
 )
 from src.inference import MultiSegmentEmbedding, RealtimeEmbedding
 from src.model import EMBEDDING_DIM
-from ui.components import metadata_rows, multisegment_metadata_rows, render_result_card
+from src.model_thresholds import MULTISEGMENT_MODEL_THRESHOLDS
+from ui.components import (
+    metadata_rows,
+    multisegment_metadata_rows,
+    render_result_card,
+    render_score_visualization,
+)
 
 
 def make_metadata() -> SpeechWindowMetadata:
@@ -261,7 +267,7 @@ class AppHelperTests(unittest.TestCase):
         verifier.extract_embedding_realtime.assert_not_called()
         self.assertEqual(result.metadata.valid_window_count, 3)
 
-    def test_app_scores_aggregates_without_threshold_or_decision(self) -> None:
+    def test_app_scores_aggregates_with_selected_multisegment_threshold(self) -> None:
         verification_embedding = torch.zeros(EMBEDDING_DIM)
         verification_embedding[0] = 0.8
         verification_embedding[1] = 0.6
@@ -274,6 +280,37 @@ class AppHelperTests(unittest.TestCase):
             "ADAPTIVE",
         )
         self.assertAlmostEqual(result["similarity"], 0.8)
+        self.assertEqual(result["threshold"], MULTISEGMENT_MODEL_THRESHOLDS["ADAPTIVE"])
+        self.assertTrue(result["same_speaker"])
+
+    def test_all_models_use_their_own_multisegment_threshold(self) -> None:
+        for label, threshold in MULTISEGMENT_MODEL_THRESHOLDS.items():
+            with self.subTest(label=label), patch("app.score_embeddings", return_value=threshold):
+                result = app.build_multisegment_verification_result(
+                    make_embedding(),
+                    MultiSegmentEmbedding(make_embedding(), make_multisegment_metadata()),
+                    label,
+                )
+            self.assertEqual(result["threshold"], threshold)
+            self.assertTrue(result["same_speaker"])
+
+    def test_below_threshold_is_different_speaker(self) -> None:
+        threshold = MULTISEGMENT_MODEL_THRESHOLDS["RAW"]
+        with patch("app.score_embeddings", return_value=threshold - 0.001):
+            result = app.build_multisegment_verification_result(
+                make_embedding(),
+                MultiSegmentEmbedding(make_embedding(), make_multisegment_metadata()),
+                "RAW",
+            )
+        self.assertFalse(result["same_speaker"])
+
+    def test_unconfigured_model_never_falls_back_to_single_window(self) -> None:
+        result = app.build_multisegment_verification_result(
+            make_embedding(),
+            MultiSegmentEmbedding(make_embedding(), make_multisegment_metadata()),
+            "CUSTOM",
+        )
+        self.assertEqual(result["similarity"], 1.0)
         self.assertIsNone(result["threshold"])
         self.assertIsNone(result["same_speaker"])
 
@@ -282,10 +319,39 @@ class AppHelperTests(unittest.TestCase):
         render_result_card(0.4281, None, None, "ADAPTIVE")
         rendered = "".join(call.args[0] for call in html_mock.call_args_list)
         self.assertIn("Speaker Similarity", rendered)
-        self.assertIn("Not calibrated", rendered)
-        self.assertIn("NOT AVAILABLE", rendered)
+        self.assertIn("Not configured", rendered)
+        self.assertIn("DECISION UNAVAILABLE", rendered)
         self.assertNotIn("Identity Match", rendered)
         self.assertNotIn("Identity Not Matched", rendered)
+
+    @patch("ui.components.st.html")
+    def test_calibrated_result_card_and_marker(self, html_mock) -> None:
+        threshold = MULTISEGMENT_MODEL_THRESHOLDS["RANDOM"]
+        render_result_card(threshold, threshold, True, "RANDOM")
+        render_score_visualization(threshold, threshold)
+        rendered = "".join(call.args[0] for call in html_mock.call_args_list)
+        self.assertIn("Cosine similarity</span><strong>0.2141", rendered)
+        self.assertIn("Operational threshold</span><strong>0.2141", rendered)
+        self.assertIn("SAME SPEAKER", rendered)
+        self.assertIn('class="threshold-line" style="left:60.703%"', rendered)
+
+    @patch("ui.components.st.html")
+    def test_different_speaker_card(self, html_mock) -> None:
+        render_result_card(0.1, MULTISEGMENT_MODEL_THRESHOLDS["RAW"], False, "RAW")
+        rendered = html_mock.call_args.args[0]
+        self.assertIn("DIFFERENT SPEAKER", rendered)
+        self.assertIn("0.2071", rendered)
+
+    @patch("app.st")
+    def test_sidebar_displays_each_selected_multisegment_threshold(self, st_mock) -> None:
+        for label, filename in app.PRIMARY_MODEL_FILES.items():
+            st_mock.selectbox.return_value = str(app.CHECKPOINT_DIRECTORY / filename)
+            app._render_sidebar([str(app.CHECKPOINT_DIRECTORY / filename)], 0, [])
+            markdown = st_mock.markdown.call_args.args[0]
+            self.assertIn(
+                f"Multi-segment operating threshold:** {MULTISEGMENT_MODEL_THRESHOLDS[label]:.4f}",
+                markdown,
+            )
 
     def test_empty_audio_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "empty"):

@@ -24,9 +24,11 @@ from src.inference import (
     MultiSegmentEmbedding,
     RealtimeEmbedding,
     SpeakerVerifier,
+    decision_from_threshold,
     score_embeddings,
 )
 from src.model import CheckpointCompatibilityError, load_checkpoint, validate_checkpoint
+from src.model_thresholds import multisegment_threshold_for_model
 from ui.components import (
     load_styles,
     render_calibration_note,
@@ -310,12 +312,14 @@ def build_multisegment_verification_result(
     verification: MultiSegmentEmbedding,
     model_label: str,
 ) -> dict[str, Any]:
-    """Score aggregated vectors without applying single-window thresholds."""
+    """Score aggregated vectors at the model's multi-segment operating point."""
 
+    similarity = score_embeddings(enrollment_embedding, verification.embedding)
+    threshold = multisegment_threshold_for_model(model_label)
     return {
-        "similarity": score_embeddings(enrollment_embedding, verification.embedding),
-        "threshold": None,
-        "same_speaker": None,
+        "similarity": similarity,
+        "threshold": threshold,
+        "same_speaker": decision_from_threshold(similarity, threshold),
         "model_label": model_label,
         "metadata": verification.metadata,
     }
@@ -425,6 +429,10 @@ def _render_sidebar(
             key="model_selector",
         )
         selected_label = _model_label(selected_model)
+        operating_threshold = multisegment_threshold_for_model(selected_label)
+        threshold_text = (
+            "not configured" if operating_threshold is None else f"{operating_threshold:.4f}"
+        )
         st.caption(f"Checkpoint: `{Path(selected_model).name}`")
         with st.expander("Advanced / Technical details"):
             st.markdown(
@@ -439,7 +447,7 @@ def _render_sidebar(
                 - **Realtime selection:** all qualifying contiguous VAD windows
                 - **Aggregation:** arithmetic mean, then L2 normalization
                 - **Scoring:** cosine similarity
-                - **Multi-segment threshold:** not calibrated
+                - **Multi-segment operating threshold:** {threshold_text}
                 - **Training condition:** {selected_label}
                 """
             )
@@ -560,7 +568,7 @@ def main() -> None:
 
     render_section_heading(
         2,
-        "Verify Identity",
+        "Verify Speaker",
         "Record 8–10 seconds of natural speech. The sentence does not need to match enrollment.",
         eyebrow="Verification",
         muted=not ready_to_verify,
@@ -600,18 +608,18 @@ def main() -> None:
         render_section_heading(
             3,
             "Verification Result",
-            "Aggregated speaker similarity is shown without an operational decision.",
+            "Aggregated cosine similarity is compared with the model's multi-segment operating threshold.",
             eyebrow="Result",
         )
         render_result_card(
             latest_result["similarity"],
-            None,
-            None,
+            latest_result["threshold"],
+            latest_result["same_speaker"],
             latest_result.get("model_label", selected_label),
         )
         render_score_visualization(
             latest_result["similarity"],
-            None,
+            latest_result["threshold"],
         )
         render_calibration_note()
         with st.expander("Verification sample details"):
